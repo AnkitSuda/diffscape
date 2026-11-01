@@ -9,7 +9,8 @@ Diffscape is a local, read-only macOS desktop app for comparing Git worktrees in
 - Local-first inspection, no hosted backend, analytics, or telemetry.
 - Read-only Git operations; no stage, commit, checkout, ref/config mutation, or network access.
 - Worktree-file identity is distinct from a shared relative path; overlap is never labeled a merge conflict.
-- Native folder picker, optional opt-in notifications, English/Hindi UI, and lazy/capped diffs.
+- Native folder picker and drag/drop, opt-in notifications, English/Hindi UI, session-only observed activity timeline, and lazy/capped diffs.
+- Switch among registered repositories, group/sort changes, and hand a selected file to a configured macOS editor.
 
 ## Development
 
@@ -22,6 +23,8 @@ pnpm tauri:dev           # native app in development
 pnpm build               # TypeScript + Vite production frontend
 pnpm lint
 pnpm test
+pnpm exec playwright install chromium # one-time E2E browser setup
+pnpm test:e2e
 pnpm format:check
 cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri:build         # ARM64/macOS .app bundle
@@ -42,4 +45,4 @@ The project sets `nodeLinker: isolated` and `virtualStoreType: global` in `pnpm-
 - [Status](docs/status.md)
 - [Architecture decisions](docs/adr/README.md)
 
-No GitHub Actions, publication, or release signing is configured.
+No GitHub Actions, publication, pull request, or release signing is configured. The Playwright suite uses a development-only bridge; real Git/watcher behavior is separately covered by Rust tests.

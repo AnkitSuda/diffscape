@@ -1,25 +1,28 @@
 # Testing
 
-The repository has runnable frontend and Rust tests. Current coverage is intentionally partial; consult [status](status.md).
+Current coverage is useful but partial; see [implementation status](status.md) for verified revision and limits.
 
 ## Commands
 
 ```sh
-pnpm build
+pnpm format:check
 pnpm lint
 pnpm test
-pnpm format:check
+pnpm exec playwright install chromium # one-time browser setup
+pnpm test:e2e
+pnpm build
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri:build
 ```
 
-## Existing coverage
+## Coverage
 
-- Frontend contract tests verify that identical paths in two worktrees remain distinct worktree-file entries, and that unique-path counts differ from worktree-file counts.
-- Rust parser test covers NUL-separated worktree paths, spaces, multiple worktrees and detached records.
-- Rust integration test creates a disposable real Git repository and an external linked worktree; it verifies staged, unstaged, untracked and committed counts, a staged rename's old/new names, total diff, Unicode text, binary detection, large-file ceiling, and unchanged main index bytes across scans/diff reads.
-- The ARM64 macOS `.app` was built and launched on the implementation host. DMG packaging timed out in Finder's AppleScript and is not configured.
+- Vitest contract tests cover aggregation, unique path vs worktree-file counts, duplicate identities, hierarchical/path grouping, observed activity ordering, and search/status/change-state facets.
+- Rust tests create disposable real repositories and linked worktrees. They cover staged, unstaged, untracked and committed changes, rename names, Unicode, binary/large limits, non-default branch/commit bases, invalid base/path/editor requests, prunable worktree metadata, read-only fixture bytes, watcher file activity, linked-worktree addition/removal, metadata-only timeline records and cleanup.
+- Playwright Chromium tests exercise the real React UI through a development-only Tauri bridge: repository open/switch/registration, linked-worktree rows, individual duplicate-path selection and diff, live snapshot/timeline updates, filter/group/sort/context preferences, browser drop-path harness, editor preference control, and 800×560 pane visibility. The bridge simulates backend responses; it does not replace Rust integration tests or prove native Tauri event transport.
+- `pnpm tauri:build` creates the ARM64 macOS `.app`. Native app launch/accessibility was manually checked; no automated Tauri driver currently launches it.
 
-## Outstanding safety and UI matrix
+## Remaining test gaps
 
-There is no automated UI/bridge test suite. Detached/missing bases, inaccessible or malformed worktrees, symlinks, invalid UTF-8 names, interrupted Git commands, concurrent external mutation, index/ref/config/remotes/modes/admin metadata snapshots, subprocess allowlist instrumentation, hook non-execution, network capture, watcher cleanup stress, VoiceOver, reduced motion, and cross-platform builds still need dedicated verification. Never use a developer's real repository as a test fixture.
+Detached/inaccessible-base matrix, malformed or invalid UTF-8 names, symlink and file-mode snapshots, concurrent external mutation, Git subprocess allowlist instrumentation, hook non-execution instrumentation, long-running watcher stress, external editor app launch, native drag/drop UI automation, VoiceOver, reduced-motion/high-contrast checks, and cross-platform builds remain unverified. Never use a developer's real repository as a test fixture.

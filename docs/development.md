@@ -11,6 +11,8 @@ pnpm tauri:dev
 pnpm build
 pnpm lint
 pnpm test
+pnpm exec playwright install chromium # one-time browser setup
+pnpm test:e2e
 pnpm format:check
 cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri:build
