@@ -26,7 +26,7 @@ The root workspace opts into `nodeLinker: isolated` and `virtualStoreType: globa
 pnpm install --frozen-lockfile
 ```
 
-Serialize installs and store maintenance; do not copy `node_modules` between worktrees. The app implementation has not yet recorded a verified two-independent-worktree install result. After verification, record the pnpm version, store path and that each worktree resolves dependencies successfully here.
+Serialize installs and store maintenance; do not copy `node_modules` between worktrees. Verified on pnpm 12.15.0: two detached linked worktrees each completed `pnpm install --frozen-lockfile` sequentially. Both reported `nodeLinker=isolated`, `virtualStoreType=global`, and resolved React/Vite to identical paths under `/Users/apple/Library/pnpm/store/v11/links`.
 
 ## Change and safety workflow
 

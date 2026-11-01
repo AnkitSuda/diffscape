@@ -27,7 +27,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri:build         # ARM64/macOS .app bundle
 ```
 
-The project sets `nodeLinker: isolated` and `virtualStoreType: global` in `pnpm-workspace.yaml`. Each linked worktree needs its own frozen install; installations share pnpm's machine-wide global virtual store. Do not run store cleanup concurrently with installs. The two-worktree install scenario is still to be verified; see [development](docs/development.md).
+The project sets `nodeLinker: isolated` and `virtualStoreType: global` in `pnpm-workspace.yaml`. Each linked worktree needs its own frozen install; installations share pnpm's machine-wide global virtual store. Do not run store cleanup concurrently with installs. Two independent linked worktrees were verified with sequential frozen installs resolving React/Vite through the same global store; see [development](docs/development.md).
 
 ## Documentation
 
