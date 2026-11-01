@@ -56,17 +56,12 @@ export default function App() {
   const [repoError, setRepoError] = useState("");
   const [loading, setLoading] = useState(false);
   const [selectedWorktree, setSelectedWorktree] = useState<string>("all");
-  const [selectedFile, setSelectedFile] = useState<{
-    worktree: Worktree;
-    file: WorktreeFile;
-  } | null>(null);
+  const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [diffMode, setDiffMode] = useState<DiffMode>("working");
-  const [diffContent, setDiffContent] = useState("");
-  const [diffLoading, setDiffLoading] = useState(false);
-  const [diffMeta, setDiffMeta] = useState<{
-    binary: boolean;
-    tooLarge: boolean;
-    truncated: boolean;
+  const [diffState, setDiffState] = useState<{
+    key: string;
+    content: string;
+    meta: { binary: boolean; tooLarge: boolean; truncated: boolean } | null;
   } | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -128,20 +123,6 @@ export default function App() {
     setSnapshot(next);
     setLastUpdated(next.scannedAt);
     setRepoError("");
-    setSelectedFile(current =>
-      current &&
-      next.worktrees.some(
-        w =>
-          w.id === current.worktree.id && w.files.some(f => f.id === current.file.id),
-      )
-        ? {
-            worktree: next.worktrees.find(w => w.id === current.worktree.id)!,
-            file: next.worktrees
-              .find(w => w.id === current.worktree.id)!
-              .files.find(f => f.id === current.file.id)!,
-          }
-        : null,
-    );
   }, []);
 
   const openRepo = useCallback(
@@ -188,7 +169,9 @@ export default function App() {
 
   useEffect(() => {
     const remembered = localStorage.getItem("diffscape-last-repository");
-    if (remembered && isNative) void openRepo(remembered);
+    if (!remembered || !isNative) return;
+    const timer = window.setTimeout(() => void openRepo(remembered), 0);
+    return () => window.clearTimeout(timer);
   }, [openRepo]);
 
   const repositoryRoot = snapshot?.root;
@@ -212,49 +195,6 @@ export default function App() {
       setWatching(false);
     };
   }, [repositoryRoot, applySnapshot]);
-
-  useEffect(() => {
-    if (!snapshot || !selectedFile) {
-      setDiffContent("");
-      setDiffMeta(null);
-      return;
-    }
-    const worktree = snapshot.worktrees.find(w => w.id === selectedFile.worktree.id);
-    if (!worktree) return;
-    const ticket = ++requestRef.current;
-    setDiffLoading(true);
-    setDiffContent("");
-    void gitApi
-      .diff(
-        worktree.path,
-        worktree.id,
-        selectedFile.file.path,
-        selectedFile.file.oldPath,
-        diffMode,
-        worktree.base,
-      )
-      .then(result => {
-        if (ticket !== requestRef.current) return;
-        setDiffContent(result.content);
-        setDiffMeta({
-          binary: result.binary,
-          tooLarge: result.tooLarge,
-          truncated: result.truncated,
-        });
-      })
-      .catch(error => {
-        if (ticket === requestRef.current) {
-          setDiffContent(String(error));
-          setDiffMeta(null);
-        }
-      })
-      .finally(() => {
-        if (ticket === requestRef.current) setDiffLoading(false);
-      });
-    return () => {
-      requestRef.current += 1;
-    };
-  }, [snapshot, selectedFile, diffMode]);
 
   const filteredWorktrees = useMemo(
     () =>
@@ -284,16 +224,52 @@ export default function App() {
         ),
     [groups, query, statusFilter],
   );
+  const selectedFile = rows.find(row => row.file.id === selectedFileId) ?? null;
+  const worktree = snapshot?.worktrees.find(w => w.id === selectedFile?.worktree.id);
+  const diffKey =
+    snapshot && selectedFile && worktree
+      ? `${snapshot.root}::${selectedFile.file.id}::${diffMode}::${worktree.base ?? "no-base"}::${snapshot.scannedAt}`
+      : "";
+  const currentDiff = diffState?.key === diffKey ? diffState : null;
+  const diffContent = currentDiff?.content ?? "";
+  const diffMeta = currentDiff?.meta ?? null;
+  const diffLoading = Boolean(diffKey && !currentDiff);
 
   useEffect(() => {
-    if (!rows.some(row => row.file.id === selectedFile?.file.id)) {
-      const first = rows[0];
-      setSelectedFile(first ? { worktree: first.worktree, file: first.file } : null);
-    }
-  }, [rows, selectedFile?.file.id]);
+    if (!snapshot || !selectedFile || !worktree || !diffKey) return;
+    const ticket = ++requestRef.current;
+    void gitApi
+      .diff(
+        worktree.path,
+        worktree.id,
+        selectedFile.file.path,
+        selectedFile.file.oldPath,
+        diffMode,
+        worktree.base,
+      )
+      .then(result => {
+        if (ticket === requestRef.current)
+          setDiffState({
+            key: diffKey,
+            content: result.content,
+            meta: {
+              binary: result.binary,
+              tooLarge: result.tooLarge,
+              truncated: result.truncated,
+            },
+          });
+      })
+      .catch(error => {
+        if (ticket === requestRef.current)
+          setDiffState({ key: diffKey, content: String(error), meta: null });
+      });
+    return () => {
+      requestRef.current += 1;
+    };
+  }, [snapshot, selectedFile, worktree, diffMode, diffKey]);
 
   const selectRow = (row: { worktree: Worktree; file: WorktreeFile }) =>
-    setSelectedFile(row);
+    setSelectedFileId(row.file.id);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement;

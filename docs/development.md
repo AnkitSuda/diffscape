@@ -2,7 +2,7 @@
 
 ## Toolchain and commands
 
-Use macOS with Xcode Command Line Tools, Rust/Cargo, Node.js compatible with Vite 7, and pnpm 12.15.0 (pinned in the root `package.json`). From the repository root:
+Use macOS with Xcode Command Line Tools, Rust/Cargo, Node.js 20.19+ (or 22.12+) for Vite 8, and pnpm 12.15.0 (pinned in the root `package.json`). From the repository root:
 
 ```sh
 pnpm install --frozen-lockfile

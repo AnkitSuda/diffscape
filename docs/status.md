@@ -1,6 +1,6 @@
 # Implementation status
 
-Last checked: 2026-11-01 in the `diffscape-2` implementation worktree (Apple Silicon macOS, pnpm 12.15.0, Rust 1.94.1, Xcode 27).
+Last checked: 2026-11-01 in the `diffscape-2` implementation worktree (Apple Silicon macOS, Node 24.16.0, pnpm 12.15.0, Vite 8.3.5, React 19.3.1, TypeScript 6.0.3, ESLint 10.14.0, Vitest 5.0.5, Rust 1.94.1, Xcode 27).
 
 This page reports verified repository evidence and known gaps. Diffscape is an early functional desktop implementation, not a signed or release-ready product.
 
