@@ -31,6 +31,16 @@ export interface Worktree {
   lastObservedChangeAt: number | null;
 }
 
+export interface ActivityEvent {
+  id: string;
+  repositoryRoot: string;
+  observedAt: number;
+  worktreeId: string;
+  worktreeLabel: string;
+  kind: "filesystem" | "worktree-added" | "worktree-removed" | string;
+  paths: string[];
+}
+
 export interface RepositorySnapshot {
   root: string;
   availableBases: string[];
@@ -39,6 +49,7 @@ export interface RepositorySnapshot {
   comparisonBaseIsManual: boolean;
   comparisonBaseError: string | null;
   worktrees: Worktree[];
+  activityEvents: ActivityEvent[];
   scannedAt: number;
 }
 
@@ -73,9 +84,28 @@ export type FileTreeNode = {
   path: string;
   children: FileTreeNode[];
   entries: TreeEntry[];
+  worktree?: Worktree | null;
 };
 
-export const buildFileTree = (rows: TreeEntry[]): FileTreeNode[] => {
+export const buildFileTree = (
+  rows: TreeEntry[],
+  groupMode: GroupMode = "path",
+): FileTreeNode[] => {
+  if (groupMode === "worktree") {
+    const groups = new Map<string, TreeEntry[]>();
+    for (const row of rows)
+      groups.set(row.worktree.id, [...(groups.get(row.worktree.id) ?? []), row]);
+    return [...groups.entries()].map(([id, entries]) => {
+      const worktree = entries[0]!.worktree;
+      return {
+        name: worktree.branch ?? worktree.path,
+        path: `@worktree:${id}`,
+        children: buildFileTree(entries, "path"),
+        entries: [],
+        worktree,
+      };
+    });
+  }
   const roots: FileTreeNode[] = [];
   for (const row of rows) {
     const segments = row.file.path.split("/").filter(Boolean);
@@ -85,7 +115,13 @@ export const buildFileTree = (rows: TreeEntry[]): FileTreeNode[] => {
       currentPath = currentPath ? `${currentPath}/${segment}` : segment;
       let node = siblings.find(child => child.name === segment);
       if (!node) {
-        node = { name: segment, path: currentPath, children: [], entries: [] };
+        node = {
+          name: segment,
+          path: currentPath,
+          children: [],
+          entries: [],
+          worktree: null,
+        };
         siblings.push(node);
       }
       if (index === segments.length - 1) node.entries.push(row);
@@ -125,6 +161,8 @@ export const sortWorktreesByObservedActivity = (worktrees: Worktree[]) =>
   );
 
 export type ChangeScope = "all" | "staged" | "unstaged" | "untracked" | "committed";
+export type FileSort = "path" | "status" | "worktree" | "activity";
+export type GroupMode = "path" | "worktree";
 
 export const filterTreeEntries = (
   rows: TreeEntry[],

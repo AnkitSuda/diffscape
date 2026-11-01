@@ -1047,3 +1047,130 @@ select:focus-visible,
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Compact utility surfaces for session activity and repository preferences. */
+.app-shell {
+  position: relative;
+}
+.repo-switcher {
+  max-width: 190px;
+  height: 27px;
+  min-width: 90px;
+  padding: 0 6px;
+  border: 1px solid var(--separator);
+  border-radius: 6px;
+  background: var(--field);
+  color: var(--secondary);
+  font-size: 11px;
+}
+.settings-menu {
+  position: relative;
+}
+.settings-menu > summary {
+  list-style: none;
+  cursor: default;
+}
+.settings-menu > summary::-webkit-details-marker {
+  display: none;
+}
+.settings-popover,
+.activity-popover {
+  position: absolute;
+  z-index: 20;
+  top: 43px;
+  right: 10px;
+  width: min(340px, calc(100vw - 24px));
+  padding: 12px;
+  border: 1px solid var(--separator);
+  border-radius: 8px;
+  background: var(--window);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
+}
+.settings-popover {
+  display: grid;
+  gap: 10px;
+}
+.settings-popover label {
+  display: grid;
+  gap: 6px;
+  color: var(--secondary);
+  font-size: 11px;
+}
+.settings-popover input {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--separator);
+  border-radius: 5px;
+  background: var(--field);
+  color: var(--text);
+  font-size: 11px;
+}
+.activity-popover {
+  width: min(380px, calc(100vw - 24px));
+  max-height: min(70vh, 560px);
+  display: flex;
+  flex-direction: column;
+}
+.activity-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--separator);
+  font-size: 12px;
+}
+.activity-items {
+  overflow: auto;
+}
+.activity-items article {
+  display: grid;
+  gap: 2px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--soft-separator);
+  font-size: 11px;
+}
+.activity-items article time,
+.activity-items article small {
+  color: var(--secondary);
+}
+.activity-items article small:last-child {
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+.activity-items p {
+  color: var(--secondary);
+  font-size: 11px;
+}
+.drop-overlay {
+  position: absolute;
+  z-index: 30;
+  inset: 45px 8px 8px;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--window) 92%, transparent);
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  pointer-events: none;
+}
+.filter-row {
+  flex-wrap: wrap;
+}
+.filter-row select {
+  flex: 1 1 calc(50% - 3px);
+  width: calc(50% - 3px);
+}
+@media (max-width: 650px) {
+  .repo-switcher {
+    max-width: 120px;
+  }
+  .topbar-actions {
+    gap: 1px;
+  }
+  .comparison-toolbar .commit-base-form {
+    display: none;
+  }
+}

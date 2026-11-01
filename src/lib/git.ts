@@ -1,5 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { DiffMode, DiffResponse, RepositorySnapshot } from "./contracts";
+import { getE2eSnapshot, isE2eMode, subscribeE2e } from "./e2eBridge";
 
 const demoPreviewEnabled =
   import.meta.env.DEV &&
@@ -7,9 +9,13 @@ const demoPreviewEnabled =
 
 export const gitApi = {
   open: (path: string, comparisonBase: string | null) =>
-    invoke<RepositorySnapshot>("open_repository", { path, comparisonBase }),
+    isE2eMode
+      ? Promise.resolve(getE2eSnapshot(path))
+      : invoke<RepositorySnapshot>("open_repository", { path, comparisonBase }),
   refresh: (path: string, comparisonBase: string | null) =>
-    invoke<RepositorySnapshot>("refresh_repository", { path, comparisonBase }),
+    isE2eMode
+      ? Promise.resolve(getE2eSnapshot(path))
+      : invoke<RepositorySnapshot>("refresh_repository", { path, comparisonBase }),
   diff: (
     worktreePath: string,
     worktreeId: string,
@@ -17,7 +23,19 @@ export const gitApi = {
     oldPath: string | null,
     mode: DiffMode,
     base: string | null,
+    contextLines = 3,
   ) => {
+    if (isE2eMode) {
+      return Promise.resolve<DiffResponse>({
+        worktreeId,
+        path,
+        oldPath,
+        content: `diff --git a/${path} b/${path}\n+++ b/${path}\n+worktree ${worktreeId}\n+context ${contextLines}\n`,
+        truncated: false,
+        binary: false,
+        tooLarge: false,
+      });
+    }
     if (demoPreviewEnabled) {
       return Promise.resolve<DiffResponse>({
         worktreeId,
@@ -37,12 +55,24 @@ export const gitApi = {
       oldPath,
       mode,
       base,
+      contextLines,
     });
   },
   watch: (path: string, comparisonBase: string | null) =>
-    invoke<void>("watch_repository", { path, comparisonBase }),
-  stop: (path: string) => invoke<void>("stop_watch", { path }),
+    isE2eMode
+      ? Promise.resolve()
+      : invoke<void>("watch_repository", { path, comparisonBase }),
+  stop: (path: string) =>
+    isE2eMode ? Promise.resolve() : invoke<void>("stop_watch", { path }),
   reveal: (path: string) => invoke<void>("reveal_path", { path }),
+  editor: (worktreePath: string, path: string, editor: string) =>
+    invoke<void>("open_in_editor", { worktreePath, path, editor }),
+  listen: (callback: (snapshot: RepositorySnapshot) => void) =>
+    isE2eMode
+      ? Promise.resolve(subscribeE2e(callback))
+      : listen<RepositorySnapshot>("repository-changed", event =>
+          callback(event.payload),
+        ),
 };
 
 export const isNative = isTauri();

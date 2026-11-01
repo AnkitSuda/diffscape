@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   isPermissionGranted,
   requestPermission,
@@ -9,7 +9,9 @@ import {
   ArrowDown,
   ArrowUp,
   Bell,
+  Clock3,
   CircleHelp,
+  ExternalLink,
   Command,
   FileCode2,
   FileDiff,
@@ -22,6 +24,7 @@ import {
   ChevronRight,
   RefreshCw,
   Search,
+  Settings2,
   Workflow,
   X,
 } from "lucide-react";
@@ -35,6 +38,9 @@ import type {
   WorktreeFile,
   FileTreeNode,
   TreeEntry,
+  ActivityEvent,
+  FileSort,
+  GroupMode,
 } from "./lib/contracts";
 import {
   aggregateCounts,
@@ -46,6 +52,7 @@ import {
 import { gitApi, isNative } from "./lib/git";
 import { translate } from "./lib/i18n";
 import { demoSnapshot } from "./lib/demo";
+import { isE2eMode, takeNextE2eRepository } from "./lib/e2eBridge";
 
 const demoPreviewEnabled =
   import.meta.env.DEV &&
@@ -60,7 +67,36 @@ const statusClasses: Record<string, string> = {
   unmerged: "status-unmerged",
 };
 
+const readRepoList = () => {
+  try {
+    const parsed: unknown = JSON.parse(
+      localStorage.getItem("diffscape-repositories") ?? "[]",
+    );
+    return Array.isArray(parsed)
+      ? parsed.filter((path): path is string => typeof path === "string")
+      : [];
+  } catch {
+    return [];
+  }
+};
+
 export default function App() {
+  const [registeredRepos, setRegisteredRepos] = useState<string[]>(readRepoList);
+  const [editorApp, setEditorApp] = useState(
+    () => localStorage.getItem("diffscape-editor") ?? "",
+  );
+  const [showTimeline, setShowTimeline] = useState(false);
+  const [activityEvents, setActivityEvents] = useState<ActivityEvent[]>([]);
+  const [dragActive, setDragActive] = useState(false);
+  const [groupMode, setGroupMode] = useState<GroupMode>(() =>
+    localStorage.getItem("diffscape-group-mode") === "worktree" ? "worktree" : "path",
+  );
+  const [fileSort, setFileSort] = useState<FileSort>(() => {
+    const value = localStorage.getItem("diffscape-file-sort");
+    return value === "status" || value === "worktree" || value === "activity"
+      ? value
+      : "path";
+  });
   const [snapshot, setSnapshot] = useState<RepositorySnapshot | null>(() =>
     demoPreviewEnabled ? demoSnapshot : null,
   );
@@ -71,6 +107,10 @@ export default function App() {
     demoPreviewEnabled ? (demoSnapshot.worktrees[0]?.files[0]?.id ?? null) : null,
   );
   const [diffMode, setDiffMode] = useState<DiffMode>("working");
+  const [contextLines, setContextLines] = useState(() => {
+    const value = Number(localStorage.getItem("diffscape-diff-context"));
+    return [0, 1, 3, 5, 10, 20].includes(value) ? value : 3;
+  });
   const [commitInput, setCommitInput] = useState("");
   const [worktreeSort, setWorktreeSort] = useState<"branch" | "activity">(() =>
     localStorage.getItem("diffscape-worktree-sort") === "activity"
@@ -171,6 +211,15 @@ export default function App() {
       changeSignatureRef.current = signature;
       snapshotRef.current = next;
       setSnapshot(next);
+      if (next.activityEvents?.length) {
+        setActivityEvents(previous => {
+          const byId = new Map(previous.map(event => [event.id, event]));
+          for (const event of next.activityEvents) byId.set(event.id, event);
+          return [...byId.values()]
+            .sort((a, b) => a.observedAt - b.observedAt)
+            .slice(-100);
+        });
+      }
       setLastUpdated(next.scannedAt);
       setRepoError("");
     },
@@ -183,11 +232,13 @@ export default function App() {
       try {
         const chosen =
           path ??
-          (await open({
-            directory: true,
-            multiple: false,
-            title: t("chooseRepositoryTitle"),
-          }));
+          (isE2eMode
+            ? takeNextE2eRepository()
+            : await open({
+                directory: true,
+                multiple: false,
+                title: t("chooseRepositoryTitle"),
+              }));
         if (!chosen || Array.isArray(chosen)) {
           if (ticket === snapshotRequestRef.current) setLoading(false);
           return;
@@ -202,6 +253,11 @@ export default function App() {
         if (ticket !== snapshotRequestRef.current) return;
         applySnapshot(next);
         localStorage.setItem("diffscape-last-repository", next.root);
+        setRegisteredRepos(previous => {
+          const updated = [...new Set([...previous, next.root])];
+          localStorage.setItem("diffscape-repositories", JSON.stringify(updated));
+          return updated;
+        });
         setSelectedWorktree("all");
       } catch (error) {
         if (ticket === snapshotRequestRef.current) setRepoError(String(error));
@@ -258,7 +314,7 @@ export default function App() {
     ? snapshot.comparisonBase
     : null;
   useEffect(() => {
-    if (!repositoryRoot || !isNative) return;
+    if (!repositoryRoot || (!isNative && !isE2eMode)) return;
     let unlisten: (() => void) | undefined;
     let active = true;
     void gitApi
@@ -269,12 +325,14 @@ export default function App() {
       .catch(() => {
         if (active) setWatching(false);
       });
-    void listen<RepositorySnapshot>("repository-changed", event => {
-      if (active && event.payload.root === repositoryRoot) applySnapshot(event.payload);
-    }).then(fn => {
-      if (active) unlisten = fn;
-      else fn();
-    });
+    void gitApi
+      .listen(payload => {
+        if (active && payload.root === repositoryRoot) applySnapshot(payload);
+      })
+      .then(fn => {
+        if (active) unlisten = fn;
+        else fn();
+      });
     return () => {
       active = false;
       unlisten?.();
@@ -282,6 +340,32 @@ export default function App() {
       setWatching(false);
     };
   }, [repositoryRoot, selectedBase, applySnapshot]);
+
+  useEffect(() => {
+    if (!isNative) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent(event => {
+        if (event.payload.type === "enter" || event.payload.type === "over")
+          setDragActive(true);
+        if (event.payload.type === "leave") setDragActive(false);
+        if (event.payload.type === "drop") {
+          setDragActive(false);
+          const path = event.payload.paths[0];
+          if (path) void openRepo(path);
+        }
+      })
+      .then(stop => {
+        if (active) unlisten = stop;
+        else void stop();
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [openRepo]);
 
   const filteredWorktrees = useMemo(
     () =>
@@ -301,14 +385,31 @@ export default function App() {
         query,
         statusFilter,
         scopeFilter,
-      ).sort(
-        (a, b) =>
+      ).sort((a, b) => {
+        if (fileSort === "status")
+          return (
+            a.file.status.localeCompare(b.file.status) ||
+            a.file.path.localeCompare(b.file.path)
+          );
+        if (fileSort === "worktree")
+          return (
+            a.worktree.path.localeCompare(b.worktree.path) ||
+            a.file.path.localeCompare(b.file.path)
+          );
+        if (fileSort === "activity")
+          return (
+            (b.worktree.lastObservedChangeAt ?? -1) -
+              (a.worktree.lastObservedChangeAt ?? -1) ||
+            a.file.path.localeCompare(b.file.path)
+          );
+        return (
           a.file.path.localeCompare(b.file.path) ||
-          a.worktree.path.localeCompare(b.worktree.path),
-      ),
-    [groups, query, statusFilter, scopeFilter],
+          a.worktree.path.localeCompare(b.worktree.path)
+        );
+      }),
+    [groups, query, statusFilter, scopeFilter, fileSort],
   );
-  const fileTree = useMemo(() => buildFileTree(rows), [rows]);
+  const fileTree = useMemo(() => buildFileTree(rows, groupMode), [rows, groupMode]);
   const sortedWorktrees = useMemo(() => {
     const list = [...(snapshot?.worktrees ?? [])];
     if (worktreeSort === "activity") {
@@ -326,7 +427,7 @@ export default function App() {
   const worktree = snapshot?.worktrees.find(w => w.id === selectedFile?.worktree.id);
   const diffKey =
     snapshot && selectedFile && worktree
-      ? `${snapshot.root}::${selectedFile.file.id}::${diffMode}::${worktree.base ?? "no-base"}::${snapshot.scannedAt}`
+      ? `${snapshot.root}::${selectedFile.file.id}::${diffMode}::${contextLines}::${worktree.base ?? "no-base"}::${snapshot.scannedAt}`
       : "";
   const currentDiff = diffState?.key === diffKey ? diffState : null;
   const diffContent = currentDiff?.content ?? "";
@@ -344,6 +445,7 @@ export default function App() {
         selectedFile.file.oldPath,
         diffMode,
         worktree.base,
+        contextLines,
       )
       .then(result => {
         if (ticket === requestRef.current)
@@ -364,7 +466,7 @@ export default function App() {
     return () => {
       requestRef.current += 1;
     };
-  }, [snapshot, selectedFile, worktree, diffMode, diffKey]);
+  }, [snapshot, selectedFile, worktree, diffMode, contextLines, diffKey]);
 
   const selectRow = (row: { worktree: Worktree; file: WorktreeFile }) =>
     setSelectedFileId(row.file.id);
@@ -443,6 +545,35 @@ export default function App() {
       setRepoError(String(error));
     }
   };
+  const openSelectedInEditor = async () => {
+    if (!selectedFile || !editorApp.trim()) return;
+    try {
+      await gitApi.editor(
+        selectedFile.worktree.path,
+        selectedFile.file.path,
+        editorApp.trim(),
+      );
+    } catch (error) {
+      setRepoError(String(error));
+    }
+  };
+  const removeCurrentRepository = () => {
+    if (!snapshot) return;
+    const removed = snapshot.root;
+    const remaining = registeredRepos.filter(path => path !== removed);
+    setRegisteredRepos(remaining);
+    localStorage.setItem("diffscape-repositories", JSON.stringify(remaining));
+    if (localStorage.getItem("diffscape-last-repository") === removed) {
+      if (remaining[0]) void openRepo(remaining[0]);
+      else {
+        localStorage.removeItem("diffscape-last-repository");
+        snapshotRef.current = null;
+        setSnapshot(null);
+        setSelectedFileId(null);
+        void gitApi.stop(removed);
+      }
+    }
+  };
   const switchLanguage = () =>
     setLanguage(value => {
       const next = value === "en" ? "hi" : "en";
@@ -466,7 +597,21 @@ export default function App() {
   };
 
   return (
-    <main className="app-shell">
+    <main
+      className="app-shell"
+      data-testid="app-shell"
+      onDragOver={event => {
+        if (isE2eMode && event.dataTransfer.types.includes("text/plain"))
+          event.preventDefault();
+      }}
+      onDrop={event => {
+        if (isE2eMode) {
+          event.preventDefault();
+          const path = event.dataTransfer.getData("text/plain");
+          if (path) void openRepo(path);
+        }
+      }}
+    >
       <header
         className={`topbar ${isNative ? "native-titlebar" : ""}`}
         data-tauri-drag-region
@@ -478,6 +623,73 @@ export default function App() {
           </span>
         </div>
         <div className="topbar-actions" data-tauri-drag-region="false">
+          {registeredRepos.length > 0 && (
+            <select
+              className="repo-switcher"
+              value={snapshot?.root ?? ""}
+              aria-label={t("repositories")}
+              onChange={event => void openRepo(event.target.value)}
+            >
+              {!snapshot && <option value="">{t("repositories")}</option>}
+              {registeredRepos.map(path => (
+                <option key={path} value={path}>
+                  {path.split(/[\\/]/).filter(Boolean).slice(-2).join("/")}
+                </option>
+              ))}
+            </select>
+          )}
+          {snapshot && registeredRepos.length > 1 && (
+            <button
+              className="icon-button"
+              aria-label={t("removeRepository")}
+              title={t("removeRepository")}
+              onClick={removeCurrentRepository}
+            >
+              <X size={14} />
+            </button>
+          )}
+          {snapshot && (
+            <button
+              className="icon-button"
+              aria-label={t("activityTimeline")}
+              title={t("activityTimeline")}
+              aria-expanded={showTimeline}
+              onClick={() => setShowTimeline(value => !value)}
+            >
+              <Clock3 size={15} />
+            </button>
+          )}
+          {snapshot && (
+            <details className="settings-menu">
+              <summary
+                className="icon-button"
+                aria-label={t("preferences")}
+                title={t("preferences")}
+              >
+                <Settings2 size={15} />
+              </summary>
+              <div className="settings-popover">
+                <label>
+                  {t("editorApplication")}
+                  <input
+                    value={editorApp}
+                    onChange={event => {
+                      setEditorApp(event.target.value);
+                      localStorage.setItem("diffscape-editor", event.target.value);
+                    }}
+                    placeholder={t("editorPlaceholder")}
+                  />
+                </label>
+                <button
+                  className="subtle-button"
+                  disabled={!selectedFile || !editorApp.trim()}
+                  onClick={() => void openSelectedInEditor()}
+                >
+                  {t("openInEditor")}
+                </button>
+              </div>
+            </details>
+          )}
           {snapshot && (
             <button
               className="icon-button"
@@ -526,6 +738,51 @@ export default function App() {
         </div>
       </header>
 
+      {showTimeline && snapshot && (
+        <aside className="activity-popover" aria-label={t("activityTimeline")}>
+          <div className="activity-heading">
+            <strong>{t("activityTimeline")}</strong>
+            <button
+              className="subtle-icon"
+              aria-label={t("clearTimeline")}
+              title={t("clearTimeline")}
+              onClick={() => setActivityEvents([])}
+            >
+              <X size={14} />
+            </button>
+          </div>
+          <div className="activity-items" role="log" aria-live="polite">
+            {activityEvents.length ? (
+              [...activityEvents].reverse().map(item => (
+                <article key={item.id}>
+                  <time>
+                    {new Date(item.observedAt).toLocaleTimeString(
+                      language === "hi" ? "hi-IN" : "en-US",
+                      { hour: "numeric", minute: "2-digit", second: "2-digit" },
+                    )}
+                  </time>
+                  <strong>
+                    {item.kind === "worktree-added"
+                      ? t("worktreeAdded")
+                      : item.kind === "worktree-removed"
+                        ? t("worktreeRemoved")
+                        : t("fileActivity")}
+                  </strong>
+                  <small>{item.worktreeLabel}</small>
+                  {item.paths.length > 0 && <small>{item.paths.join(", ")}</small>}
+                </article>
+              ))
+            ) : (
+              <p>{t("noActivity")}</p>
+            )}
+          </div>
+        </aside>
+      )}
+      {dragActive && (
+        <div className="drop-overlay" role="status">
+          {t("dropRepository")}
+        </div>
+      )}
       {!snapshot ? (
         <section className="welcome-screen">
           <h1>{t("emptyTitle")}</h1>
@@ -835,6 +1092,32 @@ export default function App() {
                     </option>
                   ))}
                 </select>
+                <select
+                  value={fileSort}
+                  aria-label={t("sortChanges")}
+                  onChange={event => {
+                    const value = event.target.value as FileSort;
+                    setFileSort(value);
+                    localStorage.setItem("diffscape-file-sort", value);
+                  }}
+                >
+                  <option value="path">{t("sortByPath")}</option>
+                  <option value="status">{t("sortByStatus")}</option>
+                  <option value="worktree">{t("sortByWorktree")}</option>
+                  <option value="activity">{t("sortByObservedActivity")}</option>
+                </select>
+                <select
+                  value={groupMode}
+                  aria-label={t("groupChanges")}
+                  onChange={event => {
+                    const value = event.target.value as GroupMode;
+                    setGroupMode(value);
+                    localStorage.setItem("diffscape-group-mode", value);
+                  }}
+                >
+                  <option value="path">{t("groupByPath")}</option>
+                  <option value="worktree">{t("groupByWorktree")}</option>
+                </select>
               </div>
               <div className="file-table-head">
                 <span>{t("path")}</span>
@@ -919,6 +1202,15 @@ export default function App() {
                         <FolderOpen size={14} />
                         <span>{t("reveal")}</span>
                       </button>
+                      <button
+                        className="subtle-button"
+                        onClick={() => void openSelectedInEditor()}
+                        title={t("openInEditor")}
+                        disabled={!editorApp.trim()}
+                      >
+                        <ExternalLink size={14} />
+                        <span>{t("openInEditor")}</span>
+                      </button>
                       <div className="view-toggle" aria-label={t("diffLayout")}>
                         <button
                           className={diffView === "unified" ? "active" : ""}
@@ -944,6 +1236,25 @@ export default function App() {
                     </div>
                   </div>
                   <div className="diff-subtoolbar">
+                    <label className="context-control">
+                      {t("contextLines")}
+                      <select
+                        aria-label={t("contextLines")}
+                        value={contextLines}
+                        onChange={event => {
+                          const value = Number(event.target.value);
+                          setContextLines(value);
+                          localStorage.setItem("diffscape-diff-context", String(value));
+                        }}
+                      >
+                        <option value={0}>0</option>
+                        <option value={1}>1</option>
+                        <option value={3}>3</option>
+                        <option value={5}>5</option>
+                        <option value={10}>10</option>
+                        <option value={20}>20</option>
+                      </select>
+                    </label>
                     <div className="mode-tabs" role="tablist" aria-label={t("mode")}>
                       <button
                         role="tab"
@@ -1151,8 +1462,17 @@ function FileTreeView({
                   size={13}
                   className={`tree-chevron ${collapsed ? "" : "open"}`}
                 />
-                <Folder size={14} className="file-glyph" />
+                {node.worktree ? (
+                  <GitBranch size={14} className="file-glyph" />
+                ) : (
+                  <Folder size={14} className="file-glyph" />
+                )}
                 <span className="tree-name">{node.name}</span>
+                {node.worktree && (
+                  <small className="tree-group-count">
+                    {node.worktree.worktreeFileChanges}
+                  </small>
+                )}
               </button>
               {!collapsed && (
                 <div role="group" className="tree-children">

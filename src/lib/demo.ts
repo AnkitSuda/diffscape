@@ -8,6 +8,7 @@ export const demoSnapshot: RepositorySnapshot = {
   comparisonBaseIsManual: true,
   comparisonBaseError: null,
   scannedAt: Date.now(),
+  activityEvents: [],
   worktrees: [
     {
       id: "/Users/ada/Projects/atlas",

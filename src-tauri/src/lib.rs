@@ -2,7 +2,7 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::io::Read;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -64,7 +64,25 @@ struct RepositorySnapshot {
     comparison_base_is_manual: bool,
     comparison_base_error: Option<String>,
     worktrees: Vec<Worktree>,
+    activity_events: Vec<ActivityEvent>,
     scanned_at: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityEvent {
+    id: String,
+    repository_root: String,
+    observed_at: u64,
+    worktree_id: String,
+    worktree_label: String,
+    kind: String,
+    paths: Vec<String>,
+}
+
+struct WatchNotice {
+    worktree_id: String,
+    paths: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -188,6 +206,10 @@ fn safe_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         return Err(String::from_utf8_lossy(&stderr).trim().to_string());
     }
     Ok(stdout)
+}
+
+fn bounded_diff_context(context_lines: Option<usize>) -> usize {
+    context_lines.unwrap_or(3).min(20)
 }
 
 fn is_safe_repo_path(path: &str) -> bool {
@@ -467,9 +489,18 @@ fn scan_repository(
     requested_base: Option<&str>,
     activity_times: Option<&HashMap<String, u64>>,
 ) -> Result<RepositorySnapshot, String> {
-    let root = root
+    let canonical = root
         .canonicalize()
         .map_err(|e| format!("Invalid repository path: {e}"))?;
+    let start = if canonical.is_file() {
+        canonical.parent().ok_or("File has no parent directory")?
+    } else {
+        canonical.as_path()
+    };
+    let top_level = git_text(start, &["rev-parse", "--show-toplevel"])?;
+    let root = PathBuf::from(top_level)
+        .canonicalize()
+        .map_err(|e| format!("Invalid Git root: {e}"))?;
     let raw = safe_git(&root, &["worktree", "list", "--porcelain", "-z"])?;
     let records = worktree_records(&raw);
     if records.is_empty() {
@@ -565,6 +596,7 @@ fn scan_repository(
         comparison_base_is_manual,
         comparison_base_error,
         worktrees,
+        activity_events: Vec::new(),
         scanned_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -596,7 +628,9 @@ fn get_file_diff(
     old_path: Option<String>,
     mode: String,
     base: Option<String>,
+    context_lines: Option<usize>,
 ) -> Result<DiffResponse, String> {
+    let context = bounded_diff_context(context_lines).to_string();
     if !is_safe_repo_path(&path)
         || old_path
             .as_deref()
@@ -647,7 +681,7 @@ fn get_file_diff(
                 "--no-textconv",
                 "--no-color",
                 "--find-renames",
-                "--unified=3",
+                &format!("--unified={context}"),
                 "--",
                 path.as_str(),
             ];
@@ -662,7 +696,7 @@ fn get_file_diff(
                 "--no-textconv".into(),
                 "--no-color".into(),
                 "--find-renames".into(),
-                "--unified=3".into(),
+                format!("--unified={context}"),
                 "--".into(),
                 path.clone(),
             ]
@@ -674,7 +708,7 @@ fn get_file_diff(
             "--no-textconv".into(),
             "--no-color".into(),
             "--find-renames".into(),
-            "--unified=3".into(),
+            format!("--unified={context}"),
             "--".into(),
             path.clone(),
         ],
@@ -687,7 +721,7 @@ fn get_file_diff(
                 "--no-textconv".into(),
                 "--no-color".into(),
                 "--find-renames".into(),
-                "--unified=3".into(),
+                format!("--unified={context}"),
                 b,
                 "--".into(),
                 path.clone(),
@@ -746,7 +780,7 @@ fn watch_repository(
 ) -> Result<(), String> {
     stop_watch_inner(&state, &path);
     scan_repository(Path::new(&path), comparison_base.as_deref(), None)?;
-    let (sender, receiver) = mpsc::sync_channel::<String>(32);
+    let (sender, receiver) = mpsc::sync_channel::<WatchNotice>(32);
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
     let root = PathBuf::from(&path);
@@ -774,8 +808,8 @@ fn run_watch_loop<F>(
     root: PathBuf,
     selected_base: Option<String>,
     stopped: Arc<AtomicBool>,
-    receiver: mpsc::Receiver<String>,
-    sender: mpsc::SyncSender<String>,
+    receiver: mpsc::Receiver<WatchNotice>,
+    sender: mpsc::SyncSender<WatchNotice>,
     mut publish: F,
 ) where
     F: FnMut(RepositorySnapshot),
@@ -783,12 +817,20 @@ fn run_watch_loop<F>(
     let mut watchers: Vec<(String, RecommendedWatcher)> = Vec::new();
     let mut activity_times = HashMap::<String, u64>::new();
     let mut last_signature = String::new();
+    let mut activity_events = VecDeque::<ActivityEvent>::new();
+    let mut known_worktrees: Option<HashMap<String, String>> = None;
     let mut last_reconcile = Instant::now() - Duration::from_secs(2);
     while !stopped.load(Ordering::Relaxed) {
-        let mut active_events = std::collections::HashSet::new();
+        let mut active_events = HashMap::<String, std::collections::HashSet<String>>::new();
+        let mut add_notice = |notice: WatchNotice| {
+            active_events
+                .entry(notice.worktree_id)
+                .or_default()
+                .extend(notice.paths);
+        };
         let event_received = match receiver.recv_timeout(Duration::from_millis(200)) {
-            Ok(worktree_id) => {
-                active_events.insert(worktree_id);
+            Ok(notice) => {
+                add_notice(notice);
                 let quiet_deadline = Instant::now() + Duration::from_millis(350);
                 while !stopped.load(Ordering::Relaxed) {
                     let remaining = quiet_deadline.saturating_duration_since(Instant::now());
@@ -796,8 +838,8 @@ fn run_watch_loop<F>(
                         break;
                     }
                     match receiver.recv_timeout(remaining) {
-                        Ok(id) => {
-                            active_events.insert(id);
+                        Ok(notice) => {
+                            add_notice(notice);
                         }
                         Err(_) => break,
                     }
@@ -817,15 +859,75 @@ fn run_watch_loop<F>(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        for worktree_id in active_events {
-            activity_times.insert(worktree_id, observed_at);
+        for worktree_id in active_events.keys() {
+            activity_times.insert(worktree_id.clone(), observed_at);
         }
-        let Ok(snapshot) = scan_repository(&root, selected_base.as_deref(), Some(&activity_times))
+        let Ok(mut snapshot) =
+            scan_repository(&root, selected_base.as_deref(), Some(&activity_times))
         else {
             last_reconcile = Instant::now();
             continue;
         };
         last_reconcile = Instant::now();
+        let current_worktrees = snapshot
+            .worktrees
+            .iter()
+            .take(64)
+            .map(|w| {
+                (
+                    w.id.clone(),
+                    w.branch.clone().unwrap_or_else(|| w.path.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        if let Some(previous) = &known_worktrees {
+            for (id, label) in &current_worktrees {
+                if !previous.contains_key(id) {
+                    activity_events.push_back(ActivityEvent {
+                        id: format!("worktree-added:{observed_at}:{id}"),
+                        repository_root: root.to_string_lossy().into_owned(),
+                        observed_at,
+                        worktree_id: id.clone(),
+                        worktree_label: label.clone(),
+                        kind: "worktree-added".into(),
+                        paths: Vec::new(),
+                    });
+                }
+            }
+            for (id, label) in previous {
+                if !current_worktrees.contains_key(id) {
+                    activity_events.push_back(ActivityEvent {
+                        id: format!("worktree-removed:{observed_at}:{id}"),
+                        repository_root: root.to_string_lossy().into_owned(),
+                        observed_at,
+                        worktree_id: id.clone(),
+                        worktree_label: label.clone(),
+                        kind: "worktree-removed".into(),
+                        paths: Vec::new(),
+                    });
+                }
+            }
+        }
+        known_worktrees = Some(current_worktrees.clone());
+        for (worktree_id, paths) in &active_events {
+            let label = current_worktrees
+                .get(worktree_id)
+                .cloned()
+                .unwrap_or_else(|| worktree_id.clone());
+            activity_events.push_back(ActivityEvent {
+                id: format!("filesystem:{observed_at}:{worktree_id}"),
+                repository_root: root.to_string_lossy().into_owned(),
+                observed_at,
+                worktree_id: worktree_id.clone(),
+                worktree_label: label,
+                kind: "filesystem".into(),
+                paths: paths.iter().take(32).cloned().collect(),
+            });
+        }
+        while activity_events.len() > 100 {
+            activity_events.pop_front();
+        }
+        snapshot.activity_events = activity_events.iter().cloned().collect();
         let active = snapshot
             .worktrees
             .iter()
@@ -861,15 +963,29 @@ fn is_git_metadata_paths(paths: &[PathBuf]) -> bool {
 fn make_watcher(
     path: &str,
     worktree_id: &str,
-    sender: mpsc::SyncSender<String>,
+    sender: mpsc::SyncSender<WatchNotice>,
 ) -> Result<RecommendedWatcher, String> {
     let worktree_id = worktree_id.to_string();
+    let watch_root = PathBuf::from(path);
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<notify::Event>| {
             if let Ok(event) = event {
                 let is_git_metadata = is_git_metadata_paths(&event.paths);
                 if !is_git_metadata {
-                    let _ = sender.try_send(worktree_id.clone());
+                    let paths = event
+                        .paths
+                        .iter()
+                        .filter_map(|changed| changed.strip_prefix(&watch_root).ok())
+                        .filter(|relative| !relative.as_os_str().is_empty())
+                        .take(32)
+                        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                        .collect::<Vec<_>>();
+                    if !paths.is_empty() {
+                        let _ = sender.try_send(WatchNotice {
+                            worktree_id: worktree_id.clone(),
+                            paths,
+                        });
+                    }
                 }
             }
         },
@@ -892,6 +1008,41 @@ fn stop_watch_inner(state: &WatchState, path: &str) {
         if let Some(stop) = running.remove(path) {
             stop.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+#[tauri::command]
+fn open_in_editor(worktree_path: String, path: String, editor: String) -> Result<(), String> {
+    if editor.trim().is_empty() || editor.len() > 1024 || editor.contains('\0') {
+        return Err("Choose a valid editor application".into());
+    }
+    if !is_safe_repo_path(&path) {
+        return Err("Unsafe repository-relative file path".into());
+    }
+    let root = PathBuf::from(&worktree_path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let target = root.join(path).canonicalize().map_err(|e| e.to_string())?;
+    if !target.starts_with(&root) || !target.is_file() {
+        return Err("Selected file is outside the worktree or unavailable".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-a")
+            .arg(editor)
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Could not launch editor: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = target;
+        Err("External editor handoff is currently supported on macOS".into())
     }
 }
 
@@ -938,6 +1089,7 @@ pub fn run() {
             get_file_diff,
             watch_repository,
             stop_watch,
+            open_in_editor,
             reveal_path
         ])
         .run(tauri::generate_context!())
@@ -1005,10 +1157,15 @@ mod tests {
         let repo = temp.join("watched");
         fs::create_dir_all(repo.join(".git")).unwrap();
         let (sender, receiver) = mpsc::sync_channel(8);
-        let watcher = make_watcher(repo.to_str().unwrap(), "worktree-id", sender).unwrap();
+        let canonical_repo = repo.canonicalize().unwrap();
+        let watcher =
+            make_watcher(canonical_repo.to_str().unwrap(), "worktree-id", sender).unwrap();
         fs::write(repo.join("changed.txt"), "change").unwrap();
         assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+            receiver
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .worktree_id,
             "worktree-id"
         );
         let quiet_until = Instant::now() + Duration::from_millis(350);
@@ -1171,9 +1328,36 @@ mod tests {
             None,
             "total".into(),
             feature.base.clone(),
+            None,
         )
         .unwrap();
         assert!(total.content.contains("feature working edit"));
+        let contextual = get_file_diff(
+            linked.to_string_lossy().into_owned(),
+            feature.id.clone(),
+            "shared.txt".into(),
+            None,
+            "total".into(),
+            feature.base.clone(),
+            Some(9),
+        )
+        .unwrap();
+        assert!(contextual.content.contains("@@"));
+        assert_eq!(bounded_diff_context(Some(99)), 20);
+        assert_eq!(bounded_diff_context(Some(0)), 0);
+        assert_eq!(bounded_diff_context(None), 3);
+        let over_context = get_file_diff(
+            linked.to_string_lossy().into_owned(),
+            feature.id.clone(),
+            "shared.txt".into(),
+            None,
+            "total".into(),
+            feature.base.clone(),
+            Some(99),
+        )
+        .unwrap();
+        assert!(over_context.content.len() <= MAX_DIFF_BYTES);
+
         let working = get_file_diff(
             repo.to_string_lossy().into_owned(),
             main.id.clone(),
@@ -1181,6 +1365,7 @@ mod tests {
             None,
             "working".into(),
             main.base.clone(),
+            None,
         )
         .unwrap();
         assert!(working.content.contains("+untracked content"));
@@ -1192,6 +1377,7 @@ mod tests {
             None,
             "working".into(),
             main.base.clone(),
+            None,
         )
         .unwrap();
         assert!(unicode.content.contains("+Unicode content"));
@@ -1203,6 +1389,7 @@ mod tests {
             None,
             "working".into(),
             main.base.clone(),
+            None,
         )
         .unwrap();
         assert!(binary.binary);
@@ -1218,6 +1405,7 @@ mod tests {
             None,
             "working".into(),
             main.base.clone(),
+            None,
         )
         .unwrap();
         assert!(large.too_large);
@@ -1303,7 +1491,7 @@ mod tests {
         let repo = temp.join("checkout");
         let linked = temp.join("linked checkout");
         init_repository(&repo);
-        let (sender, receiver) = mpsc::sync_channel::<String>(32);
+        let (sender, receiver) = mpsc::sync_channel::<WatchNotice>(32);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let (published, updates) = mpsc::channel();
@@ -1330,6 +1518,15 @@ mod tests {
             .iter()
             .any(|file| file.path == "tracked.txt" && file.unstaged));
         assert!(changed.worktrees[0].last_observed_change_at.is_some());
+        let observed = changed
+            .activity_events
+            .iter()
+            .find(|event| event.kind == "filesystem")
+            .unwrap();
+        assert!(observed.paths.iter().any(|path| path == "tracked.txt"));
+        assert!(!serde_json::to_string(observed)
+            .unwrap()
+            .contains("live edit"));
 
         run_git(
             &temp.join("checkout"),
@@ -1348,6 +1545,10 @@ mod tests {
                 break candidate;
             }
         };
+        assert!(added
+            .activity_events
+            .iter()
+            .any(|event| event.kind == "worktree-added"));
         let linked_id = added
             .worktrees
             .iter()
@@ -1381,10 +1582,31 @@ mod tests {
             }
         };
         assert_eq!(removed.worktrees[0].id, id);
+        assert!(removed
+            .activity_events
+            .iter()
+            .any(|event| event.kind == "worktree-removed"));
         stop.store(true, Ordering::Relaxed);
         thread.join().unwrap();
         assert!(updates.recv_timeout(Duration::from_millis(50)).is_err());
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn editor_handoff_rejects_invalid_application_and_escaping_paths() {
+        assert!(open_in_editor(
+            "/not/a/repository".into(),
+            "../secret".into(),
+            "Code".into()
+        )
+        .is_err());
+        assert!(open_in_editor("/not/a/repository".into(), "file.rs".into(), "  ".into()).is_err());
+        assert!(open_in_editor(
+            "/not/a/repository".into(),
+            "file.rs".into(),
+            "Code\0--args".into()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1403,6 +1625,7 @@ mod tests {
             None,
             "total".into(),
             Some(injected_base),
+            None,
         );
         assert!(result.is_err());
         assert!(!marker.exists());
