@@ -1,20 +1,7 @@
 # UI and design
 
-**Status: design principles only; no UI is present in this checkout.**
+**Status: a three-pane interface is implemented; accessibility and visual QA remain early.** The app includes a worktree sidebar, filtered changed-file list, and lazy diff pane, plus a repository summary, scan-activity panel, working/staged/total modes, unified/split layouts, status/path filters, keyboard search/navigation, refresh, native folder selection, Finder reveal and opt-in notifications.
 
-## Product posture
+Same-path overlap across worktrees is marked as a shared path and explicitly not called a merge conflict. Detached HEAD and missing comparison bases have labels. File names and diff contents render as text.
 
-Diffscape should feel like a calm inspection surface, not a Git command center. Keep the active scope and freshness visible. The app is read-only: do not make common Git mutations look like available actions, and do not use disabled mutation controls as a substitute for removing them.
-
-## Intended interaction principles
-
-- Group repositories with their worktrees and make identity/state scannable.
-- Separate clean, changed, detached, inaccessible, and stale/unknown observations using text and semantic labels, not color alone.
-- Keep refresh explicit and communicate that other processes can change repository state at any time.
-- Provide useful empty, loading, partial-result, permission-denied, and malformed-repository states.
-- Preserve keyboard navigation, visible focus, VoiceOver-readable labels, and adequate contrast.
-- Respect macOS conventions, reduced motion, system appearance, and window resizing.
-- Treat file names, branch names, paths, and diff text as untrusted; render as text, never executable markup.
-- Do not expose full diff content by default if it is unnecessary to the aggregation view; give users clear control over any sensitive detail display.
-
-No visual design system, component library, or interaction has been implemented or selected yet.
+Current UI includes focus styles and semantic labels. It has not been reviewed with VoiceOver, reduced-motion settings, high contrast, very long translations, narrow window sizes, or systematic keyboard-only scenarios. The timeline reports scan activity, not commit history. Editor launch and configurable status filters are not implemented.

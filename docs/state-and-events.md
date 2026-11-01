@@ -1,24 +1,11 @@
 # State and events
 
-**Status: proposed model; no state store or event contract exists in this checkout.**
-
-## Ownership
-
-- Rust should own authoritative discovery snapshots and platform/Git observations.
-- The frontend should own ephemeral presentation state: selected rows, expanded details, sort/filter criteria, and current view.
-- Persistent app preferences, if introduced, should be local, minimal, and distinct from repositories. They must not persist repository content or remote-service credentials.
-- Git state is externally mutable. The app's displayed values are timestamped observations, not authoritative locks or promises of freshness.
+**Status: implemented with small typed command/event contracts; no formal versioning yet.** Rust produces repository snapshots. React owns presentation, selected worktree/file, filters, diff mode and view layout. Minimal preferences (last repository path, language and notification opt-in) use local storage; contents/diffs are not persisted.
 
 ## Commands and events
 
-The intended interface uses explicit typed requests and responses for actions such as starting an initial scan or refreshing a selected scope. Events may report progress, completion, and per-path failures if implementation needs asynchronous discovery. Event names, payload schemas, cancellation semantics, and ordering are not defined yet.
+The frontend uses purpose-specific commands for open/refresh, lazy file diff, watcher start/stop, and path reveal. Rust emits `repository-changed` snapshots after debounced filesystem events or periodic metadata reconciliation. Diff requests carry worktree path/ID, relative path, optional old name, mode and comparison base. Responses include truncation, binary and large-file flags.
 
-Any eventual contract should:
+The frontend ignores older same-repository snapshots by timestamp and guards diff requests with monotonically increasing request IDs. The watcher uses a bounded event queue, observes at most 64 worktrees and reconciles membership every two seconds; stopping removes the cancellation token and drops observers. Snapshot delivery means only that an observation completed; the underlying repository may change at any time.
 
-- scope results to a scan/request identifier so stale work cannot overwrite a newer snapshot;
-- represent partial success and per-item errors explicitly;
-- make cancellation and app shutdown safe, without leaving repository changes (there should be none);
-- avoid emitting full diffs or sensitive paths to logs by default;
-- keep payloads versionable and validate them at the Tauri boundary.
-
-Refresh is observational, not a Git mutation. Avoid claims that event delivery means the underlying repository remains unchanged after the event.
+Formal schema versioning, per-worktree partial errors, cancellation of in-flight Git subprocesses when a window closes, and automated race/cleanup tests are not implemented.

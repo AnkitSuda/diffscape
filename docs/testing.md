@@ -1,19 +1,25 @@
-# Testing strategy
+# Testing
 
-**Status: no test framework or tests exist in this checkout.** Test commands must be added only after manifests and scripts exist; no verification command is currently supported.
+The repository has runnable frontend and Rust tests. Current coverage is intentionally partial; consult [status](status.md).
 
-## Intended layers
+## Commands
 
-- **Rust unit tests:** path identity, parsing, error mapping, and domain invariants using temporary repositories/filesystems.
-- **Git adapter tests:** disposable real repositories; compare before/after state to prove strict read-only behavior for every operation.
-- **Bridge contract tests:** validate typed command/event payloads, path scoping, malformed input, and permission/error cases.
-- **Frontend tests:** loading/empty/error/partial/stale states, keyboard interaction, and safe rendering of hostile names and diff text.
-- **Tauri/macOS checks:** app permissions, file access, window behavior, VoiceOver, signing/distribution assumptions, and supported macOS versions once declared.
+```sh
+pnpm build
+pnpm lint
+pnpm test
+pnpm format:check
+cargo test --manifest-path src-tauri/Cargo.toml
+pnpm tauri:build
+```
 
-## Safety regression matrix
+## Existing coverage
 
-At minimum, cover clean and dirty repositories, staged/unstaged/untracked changes, detached HEAD, linked worktrees, nested paths, spaces and unusual characters, symlinks, inaccessible paths, non-repositories, malformed metadata, and a repository changing concurrently. Record repository state before and after every inspection test. Assert no network activity and no hook/script execution. Tests must never touch a developer's real repository.
+- Frontend contract tests verify that identical paths in two worktrees remain distinct worktree-file entries, and that unique-path counts differ from worktree-file counts.
+- Rust parser test covers NUL-separated worktree paths, spaces, multiple worktrees and detached records.
+- Rust integration test creates a disposable real Git repository and an external linked worktree; it verifies staged, unstaged, untracked and committed counts, a staged rename's old/new names, total diff, Unicode text, binary detection, large-file ceiling, and unchanged main index bytes across scans/diff reads.
+- The ARM64 macOS `.app` was built and launched on the implementation host. DMG packaging timed out in Finder's AppleScript and is not configured.
 
-## Reporting results
+## Outstanding safety and UI matrix
 
-Contributors should list exact commands, platform/tool versions, and outcomes. If a check cannot run (including because tooling is not implemented), say so; do not substitute an unverified command or mark the change fully tested.
+There is no automated UI/bridge test suite. Detached/missing bases, inaccessible or malformed worktrees, symlinks, invalid UTF-8 names, interrupted Git commands, concurrent external mutation, index/ref/config/remotes/modes/admin metadata snapshots, subprocess allowlist instrumentation, hook non-execution, network capture, watcher cleanup stress, VoiceOver, reduced motion, and cross-platform builds still need dedicated verification. Never use a developer's real repository as a test fixture.

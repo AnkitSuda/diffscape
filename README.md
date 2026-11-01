@@ -1,39 +1,45 @@
 # Diffscape
 
-Diffscape is a planned read-only macOS app for bringing Git worktrees together in one view. Its intended stack is Tauri 2, Rust, React, TypeScript, Vite, and pnpm.
+Diffscape is a local, read-only macOS desktop app for comparing Git worktrees in one place. It aggregates changed relative paths while keeping each worktree's copy distinct, and provides working, staged, and merge-base total diffs.
 
-> **Project status:** early documentation baseline. This checkout currently contains no app source, package manifest, Rust crate, release, or test suite. The product and architecture docs below distinguish design intent from implemented behavior. Do not rely on Diffscape for repository inspection until implementation and safety tests exist.
+**Status:** early functional implementation. The ARM64 macOS `.app` builds and launches on the implementation host. Safety and integration tests cover a useful core but not the full release matrix; see [implementation status](docs/status.md) before relying on it for sensitive repositories.
 
-## Intended principles
+## Product principles
 
-- Local-first: inspect repositories and worktrees on the user's Mac.
-- Strictly read-only: never alter repository state or invoke mutating Git operations.
-- No remote services: no cloud account, sync, telemetry, analytics, or hosted backend is part of the product contract.
-- macOS-focused, with native capabilities exposed through a narrow Tauri/Rust boundary.
-
-See [the status page](docs/status.md) for the evidence-based implementation snapshot and [the documentation index](docs/README.md) for the design and development notes.
+- Local-first inspection, no hosted backend, analytics, or telemetry.
+- Read-only Git operations; no stage, commit, checkout, ref/config mutation, or network access.
+- Worktree-file identity is distinct from a shared relative path; overlap is never labeled a merge conflict.
+- Native folder picker, optional opt-in notifications, English/Hindi UI, and lazy/capped diffs.
 
 ## Development
 
-There is no supported install, build, or run command in this baseline: the source tree and package manifests are not present. Do not run guessed `pnpm` or Cargo commands. When implementation lands, this section must be replaced with verified prerequisites and commands, including the required pnpm global virtual store and two-worktree guidance.
+Prerequisites: macOS with Xcode Command Line Tools, Rust/Cargo, Node.js compatible with Vite 7, and pnpm 12.15.0 (`packageManager` is pinned).
 
-## Documentation map
+```sh
+pnpm install --frozen-lockfile
+pnpm dev                 # Vite frontend only
+pnpm tauri:dev           # native app in development
+pnpm build               # TypeScript + Vite production frontend
+pnpm lint
+pnpm test
+pnpm format:check
+cargo test --manifest-path src-tauri/Cargo.toml
+pnpm tauri:build         # ARM64/macOS .app bundle
+```
 
-- [Architecture](docs/architecture.md) — intended process boundaries and responsibilities
-- [Development](docs/development.md) — planned local workflow and worktree package-store policy
-- [Git integration](docs/git-integration.md) — safe discovery and data model
-- [Read-only contract](docs/read-only-contract.md) — prohibited effects and verification obligations
-- [State and events](docs/state-and-events.md) — intended state ownership and event semantics
-- [UI and design](docs/ui-and-design.md) — interaction and accessibility principles
-- [Internationalization](docs/i18n.md) — localization policy and current state
-- [Testing](docs/testing.md) — safety-focused test strategy and current gaps
-- [Status](docs/status.md) — implemented vs. intended inventory
-- [Architecture decisions](docs/adr/README.md) — concise decisions and proposals
+The project sets `nodeLinker: isolated` and `virtualStoreType: global` in `pnpm-workspace.yaml`. Each linked worktree needs its own frozen install; installations share pnpm's machine-wide global virtual store. Do not run store cleanup concurrently with installs. The two-worktree install scenario is still to be verified; see [development](docs/development.md).
 
-## Contributing and safety reports
+## Documentation
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. Report vulnerabilities privately using [SECURITY.md](SECURITY.md); do not put exploit details in a public issue.
+- [Architecture](docs/architecture.md)
+- [Development](docs/development.md)
+- [Git integration](docs/git-integration.md)
+- [Read-only contract](docs/read-only-contract.md)
+- [State and events](docs/state-and-events.md)
+- [UI and design](docs/ui-and-design.md)
+- [Internationalization](docs/i18n.md)
+- [Testing](docs/testing.md)
+- [Status](docs/status.md)
+- [Architecture decisions](docs/adr/README.md)
 
-## License
-
-Distributed under the MIT License. See [LICENSE](LICENSE).
+No GitHub Actions, publication, or release signing is configured.

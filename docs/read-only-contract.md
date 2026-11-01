@@ -1,27 +1,18 @@
 # Read-only contract
 
-**This is a non-negotiable product requirement, not a statement that the current code has been verified.** The baseline contains no Git integration implementation. Any future release must prove this contract before claiming safe repository inspection.
+Read-only is a product requirement. The current adapter is designed around fixed, inspected, read-only Git operations, but the available tests do not yet establish a complete formal guarantee.
 
-## Allowed intent
+## Implemented safeguards
 
-Read local repository and worktree metadata to display a user-requested snapshot. Read-only commands may still have incidental effects outside repository state (for example OS process accounting); implementation must minimize them and document any unavoidable local app state.
+- Git commands are invoked with `Command` argument vectors, never through a shell or generic user-provided command string.
+- Optional Git locks are disabled; prompts and global/system config are disabled.
+- Hook path is neutralized, pagers suppressed, external diff and textconv disabled.
+- Diff paths are passed after `--`; diff size, file size, output, path count, worktree count and command duration are capped.
+- No stage/commit/checkout/ref/config/worktree mutation, fetch, or other network Git command is exposed.
+- A real temporary-repository test confirms Git index bytes remain unchanged across discovery and diff reads.
 
-## Forbidden effects
+## Limitations
 
-Diffscape must not alter any target repository's:
+The integration test does not yet snapshot every ref/config/remotes/file mode/worktree administrative record before and after. It does not instrument all subprocesses, test hook non-execution, denied permissions, interruption, malformed metadata, invalid UTF-8 names, or concurrent external writes. `GIT_CONFIG_NOSYSTEM` and `GIT_CONFIG_GLOBAL` do not neutralize repository-local configuration, though the executed command set and diff flags are restricted. Do not interpret current tests as a security certification.
 
-- working-tree files or file modes;
-- index or lock files;
-- refs, `HEAD`, branch state, tags, or object database;
-- Git configuration, remotes, hooks, or attributes;
-- worktree registration, administrative metadata, or repository-local state.
-
-It must not stage, commit, checkout, switch, reset, clean, stash, merge, rebase, cherry-pick, fetch, pull, push, tag, amend refs, install hooks, or invoke an operation that can do these indirectly. It must not execute repository hooks, aliases, shell startup files, or arbitrary scripts during discovery. No network fetch or service call is allowed.
-
-## User interface implication
-
-Read-only means more than omitting a “Save” button. The app must have no code path or bridge capability that changes repositories. Do not expose ambiguous mutation affordances or describe external changes as app-authored actions. A refresh requests another observation only.
-
-## Required verification before release
-
-For each supported inspection path, tests should capture a disposable repository's refs, index state, worktree file hashes/modes, config, remotes, and worktree metadata before and after the operation and assert equality. Include detached HEAD, linked worktrees, dirty/untracked files, unusual path names, malformed metadata, denied permissions, interruption, and concurrent external changes. Instrument or constrain subprocess arguments so only reviewed read-only commands can run. Add negative tests proving forbidden commands and hooks are never invoked.
+Diffscape stores minimal preferences in local app storage and can open a selected path in Finder. Neither operation writes to the inspected repository. There is no network service, telemetry or repository-content persistence.
