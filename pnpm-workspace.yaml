@@ -1,0 +1,8 @@
+packages:
+  - .
+
+nodeLinker: isolated
+virtualStoreType: global
+
+allowBuilds:
+  esbuild: true
