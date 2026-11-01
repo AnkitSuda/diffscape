@@ -9,7 +9,6 @@ import {
   ArrowDown,
   ArrowUp,
   Bell,
-  ChevronDown,
   CircleHelp,
   Command,
   FileCode2,
@@ -23,7 +22,6 @@ import {
   ChevronRight,
   RefreshCw,
   Search,
-  Settings2,
   Workflow,
   X,
 } from "lucide-react";
@@ -41,6 +39,7 @@ import type {
 import {
   aggregateCounts,
   buildFileTree,
+  filterTreeEntries,
   samePathGroups,
   sortWorktreesByObservedActivity,
 } from "./lib/contracts";
@@ -73,7 +72,11 @@ export default function App() {
   );
   const [diffMode, setDiffMode] = useState<DiffMode>("working");
   const [commitInput, setCommitInput] = useState("");
-  const [worktreeSort, setWorktreeSort] = useState<"branch" | "activity">("branch");
+  const [worktreeSort, setWorktreeSort] = useState<"branch" | "activity">(() =>
+    localStorage.getItem("diffscape-worktree-sort") === "activity"
+      ? "activity"
+      : "branch",
+  );
   const [collapsedDirectories, setCollapsedDirectories] = useState<Set<string>>(
     () => new Set(),
   );
@@ -89,13 +92,18 @@ export default function App() {
   } | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [scopeFilter, setScopeFilter] = useState<
+    "all" | "staged" | "unstaged" | "untracked" | "committed"
+  >("all");
   const [language, setLanguage] = useState<Language>(() =>
     localStorage.getItem("diffscape-language") === "hi" ? "hi" : "en",
   );
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [watching, setWatching] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [diffView, setDiffView] = useState<"split" | "unified">("unified");
+  const [diffView, setDiffView] = useState<"split" | "unified">(() =>
+    localStorage.getItem("diffscape-diff-view") === "split" ? "split" : "unified",
+  );
   const [notifications, setNotifications] = useState(
     () => localStorage.getItem("diffscape-notifications") === "true",
   );
@@ -110,7 +118,10 @@ export default function App() {
     startX: number;
     startWidth: number;
   } | null>(null);
-  const t = (key: Parameters<typeof translate>[1]) => translate(language, key);
+  const t = useCallback(
+    (key: Parameters<typeof translate>[1]) => translate(language, key),
+    [language],
+  );
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -124,55 +135,63 @@ export default function App() {
     else delete document.documentElement.dataset.appearance;
   }, []);
 
-  const applySnapshot = useCallback((next: RepositorySnapshot) => {
-    const accepted = snapshotRef.current;
-    if (accepted?.root === next.root && accepted.scannedAt > next.scannedAt) return;
-    const signature = JSON.stringify(
-      next.worktrees.map(worktree =>
-        worktree.files.map(file => [
-          file.id,
-          file.status,
-          file.staged,
-          file.unstaged,
-          file.untracked,
-          file.committed,
-        ]),
-      ),
-    );
-    if (
-      accepted?.root === next.root &&
-      changeSignatureRef.current &&
-      changeSignatureRef.current !== signature &&
-      notificationPreferenceRef.current
-    ) {
-      const changed = next.worktrees.reduce(
-        (total, worktree) => total + worktree.worktreeFileChanges,
-        0,
+  const applySnapshot = useCallback(
+    (next: RepositorySnapshot) => {
+      const accepted = snapshotRef.current;
+      if (accepted?.root === next.root && accepted.scannedAt > next.scannedAt) return;
+      const signature = JSON.stringify(
+        next.worktrees.map(worktree =>
+          worktree.files.map(file => [
+            file.id,
+            file.status,
+            file.staged,
+            file.unstaged,
+            file.untracked,
+            file.committed,
+          ]),
+        ),
       );
-      sendNotification({
-        title: "Diffscape · changes updated",
-        body: `${changed} worktree-file changes across ${next.worktrees.length} worktrees.`,
-      });
-    }
-    changeSignatureRef.current = signature;
-    snapshotRef.current = next;
-    setSnapshot(next);
-    setLastUpdated(next.scannedAt);
-    setRepoError("");
-  }, []);
+      if (
+        accepted?.root === next.root &&
+        changeSignatureRef.current &&
+        changeSignatureRef.current !== signature &&
+        notificationPreferenceRef.current
+      ) {
+        const changed = next.worktrees.reduce(
+          (total, worktree) => total + worktree.worktreeFileChanges,
+          0,
+        );
+        sendNotification({
+          title: t("changedNotificationTitle"),
+          body: t("changedNotificationBody")
+            .replace("{files}", String(changed))
+            .replace("{worktrees}", String(next.worktrees.length)),
+        });
+      }
+      changeSignatureRef.current = signature;
+      snapshotRef.current = next;
+      setSnapshot(next);
+      setLastUpdated(next.scannedAt);
+      setRepoError("");
+    },
+    [t],
+  );
 
   const openRepo = useCallback(
     async (path?: string) => {
+      const ticket = ++snapshotRequestRef.current;
       try {
         const chosen =
           path ??
           (await open({
             directory: true,
             multiple: false,
-            title: "Choose a Git repository",
+            title: t("chooseRepositoryTitle"),
           }));
-        if (!chosen || Array.isArray(chosen)) return;
-        const ticket = ++snapshotRequestRef.current;
+        if (!chosen || Array.isArray(chosen)) {
+          if (ticket === snapshotRequestRef.current) setLoading(false);
+          return;
+        }
         setLoading(true);
         setRepoError("");
         const initial = await gitApi.open(chosen, null);
@@ -185,12 +204,12 @@ export default function App() {
         localStorage.setItem("diffscape-last-repository", next.root);
         setSelectedWorktree("all");
       } catch (error) {
-        setRepoError(String(error));
+        if (ticket === snapshotRequestRef.current) setRepoError(String(error));
       } finally {
-        setLoading(false);
+        if (ticket === snapshotRequestRef.current) setLoading(false);
       }
     },
-    [applySnapshot],
+    [applySnapshot, t],
   );
 
   const refresh = useCallback(async () => {
@@ -204,9 +223,9 @@ export default function App() {
       );
       if (ticket === snapshotRequestRef.current) applySnapshot(next);
     } catch (error) {
-      setRepoError(String(error));
+      if (ticket === snapshotRequestRef.current) setRepoError(String(error));
     } finally {
-      setLoading(false);
+      if (ticket === snapshotRequestRef.current) setLoading(false);
     }
   }, [applySnapshot, snapshot]);
 
@@ -275,22 +294,19 @@ export default function App() {
   const counts = useMemo(() => aggregateCounts(filteredWorktrees), [filteredWorktrees]);
   const rows = useMemo(
     () =>
-      groups
-        .flatMap(group =>
+      filterTreeEntries(
+        groups.flatMap(group =>
           group.entries.map(entry => ({ ...entry, shared: group.entries.length > 1 })),
-        )
-        .filter(
-          row =>
-            row.file.path.toLocaleLowerCase().includes(query.toLocaleLowerCase()) ||
-            row.file.oldPath?.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
-        )
-        .filter(row => statusFilter === "all" || row.file.status === statusFilter)
-        .sort(
-          (a, b) =>
-            a.file.path.localeCompare(b.file.path) ||
-            a.worktree.path.localeCompare(b.worktree.path),
         ),
-    [groups, query, statusFilter],
+        query,
+        statusFilter,
+        scopeFilter,
+      ).sort(
+        (a, b) =>
+          a.file.path.localeCompare(b.file.path) ||
+          a.worktree.path.localeCompare(b.worktree.path),
+      ),
+    [groups, query, statusFilter, scopeFilter],
   );
   const fileTree = useMemo(() => buildFileTree(rows), [rows]);
   const sortedWorktrees = useMemo(() => {
@@ -458,7 +474,7 @@ export default function App() {
         <div className="toolbar-title" data-tauri-drag-region>
           {!isNative && <span className="brand-name">Diffscape</span>}
           <span className="breadcrumb-root" title={snapshot?.root ?? ""}>
-            {snapshot?.root ?? "No Repository Open"}
+            {snapshot?.root ?? t("noRepoOpen")}
           </span>
         </div>
         <div className="topbar-actions" data-tauri-drag-region="false">
@@ -466,8 +482,8 @@ export default function App() {
             <button
               className="icon-button"
               onClick={() => setSidebarOpen(value => !value)}
-              aria-label={sidebarOpen ? "Hide worktrees" : "Show worktrees"}
-              title={sidebarOpen ? "Hide worktrees" : "Show worktrees"}
+              aria-label={sidebarOpen ? t("hideWorktrees") : t("showWorktrees")}
+              title={sidebarOpen ? t("hideWorktrees") : t("showWorktrees")}
             >
               <PanelLeftClose size={15} />
             </button>
@@ -476,10 +492,8 @@ export default function App() {
             <button
               className={`icon-button ${notifications ? "notification-on" : ""}`}
               onClick={() => void toggleNotifications()}
-              aria-label={
-                notifications ? "Turn off notifications" : "Turn on notifications"
-              }
-              title={notifications ? "Notifications on" : "Notifications off"}
+              aria-label={notifications ? t("notificationsOff") : t("notificationsOn")}
+              title={notifications ? t("notificationsOn") : t("notificationsOff")}
             >
               <Bell size={15} />
             </button>
@@ -620,7 +634,7 @@ export default function App() {
                 <button
                   className="subtle-icon"
                   onClick={() => setSidebarOpen(false)}
-                  aria-label="Collapse sidebar"
+                  aria-label={t("collapseSidebar")}
                 >
                   <PanelLeftClose size={15} />
                 </button>
@@ -634,7 +648,9 @@ export default function App() {
                 </div>
                 <div className="wt-text">
                   <strong>{t("all")}</strong>
-                  <small>{snapshot.worktrees.length} worktrees</small>
+                  <small>
+                    {snapshot.worktrees.length} {t("worktreeCount")}
+                  </small>
                 </div>
                 <span className="wt-count">{counts.worktreeFileChanges}</span>
               </button>
@@ -645,7 +661,11 @@ export default function App() {
                 <select
                   value={worktreeSort}
                   onChange={event =>
-                    setWorktreeSort(event.target.value as "branch" | "activity")
+                    (() => {
+                      const value = event.target.value as "branch" | "activity";
+                      localStorage.setItem("diffscape-worktree-sort", value);
+                      setWorktreeSort(value);
+                    })()
                   }
                 >
                   <option value="branch">{t("sortByBranch")}</option>
@@ -673,7 +693,7 @@ export default function App() {
                       <strong>
                         {worktree.detached
                           ? t("detached")
-                          : (worktree.branch ?? "(unknown branch)")}
+                          : (worktree.branch ?? t("unknownBranch"))}
                       </strong>
                       <small>
                         {worktree.isMain
@@ -717,7 +737,7 @@ export default function App() {
               className={`pane-splitter sidebar-splitter ${sidebarOpen ? "" : "is-hidden"}`}
               role="separator"
               aria-orientation="vertical"
-              aria-label="Resize worktree sidebar"
+              aria-label={t("resizeWorktreeSidebar")}
               aria-valuenow={sidebarWidth}
               tabIndex={sidebarOpen ? 0 : -1}
               onPointerDown={event => beginResize("sidebar", event)}
@@ -737,7 +757,7 @@ export default function App() {
               <button
                 className="expand-sidebar"
                 onClick={() => setSidebarOpen(true)}
-                aria-label="Expand sidebar"
+                aria-label={t("expandSidebar")}
               >
                 <PanelLeftClose size={16} />
               </button>
@@ -766,7 +786,7 @@ export default function App() {
                 />
                 <kbd>/</kbd>
                 {query && (
-                  <button onClick={() => setQuery("")} aria-label="Clear search">
+                  <button onClick={() => setQuery("")} aria-label={t("clearSearch")}>
                     <X size={12} />
                   </button>
                 )}
@@ -778,22 +798,43 @@ export default function App() {
                   aria-label={t("allStatuses")}
                 >
                   <option value="all">{t("allStatuses")}</option>
-                  {["modified", "added", "deleted", "renamed", "untracked"].map(
-                    status => (
-                      <option key={status} value={status}>
-                        {t(
-                          status === "untracked"
-                            ? "untrackedStatus"
-                            : (status as "modified" | "added" | "deleted" | "renamed"),
-                        )}
-                      </option>
-                    ),
-                  )}
+                  {[
+                    "modified",
+                    "added",
+                    "deleted",
+                    "renamed",
+                    "untracked",
+                    "unmerged",
+                  ].map(status => (
+                    <option key={status} value={status}>
+                      {t(
+                        status === "untracked"
+                          ? "untrackedStatus"
+                          : (status as
+                              | "modified"
+                              | "added"
+                              | "deleted"
+                              | "renamed"
+                              | "unmerged"),
+                      )}
+                    </option>
+                  ))}
                 </select>
-                <button className="filter-more" title="Filter options">
-                  <Settings2 size={13} />
-                  <ChevronDown size={11} />
-                </button>
+                <select
+                  value={scopeFilter}
+                  onChange={event =>
+                    setScopeFilter(event.target.value as typeof scopeFilter)
+                  }
+                  aria-label={t("changeScope")}
+                >
+                  {(
+                    ["all", "staged", "unstaged", "untracked", "committed"] as const
+                  ).map(scope => (
+                    <option key={scope} value={scope}>
+                      {t(scope === "all" ? "allChanges" : scope)}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="file-table-head">
                 <span>{t("path")}</span>
@@ -809,6 +850,7 @@ export default function App() {
                   collapsedSharedPaths={collapsedSharedPaths}
                   setCollapsedSharedPaths={setCollapsedSharedPaths}
                   worktreeLabel={item => item.branch ?? t("detached")}
+                  worktreesLabel={t("worktreePlural")}
                 />
                 {!rows.length && (
                   <div className="empty-list">
@@ -836,7 +878,7 @@ export default function App() {
               className="pane-splitter list-splitter"
               role="separator"
               aria-orientation="vertical"
-              aria-label="Resize file list"
+              aria-label={t("resizeFileList")}
               aria-valuenow={listWidth}
               tabIndex={0}
               onPointerDown={event => beginResize("list", event)}
@@ -852,7 +894,7 @@ export default function App() {
                 }
               }}
             />
-            <section className="diff-pane" aria-label="Diff viewer">
+            <section className="diff-pane" aria-label={t("diffViewer")}>
               {selectedFile ? (
                 <>
                   <div className="diff-toolbar">
@@ -877,18 +919,24 @@ export default function App() {
                         <FolderOpen size={14} />
                         <span>{t("reveal")}</span>
                       </button>
-                      <div className="view-toggle" aria-label="Diff layout">
+                      <div className="view-toggle" aria-label={t("diffLayout")}>
                         <button
                           className={diffView === "unified" ? "active" : ""}
-                          onClick={() => setDiffView("unified")}
-                          title="Unified diff"
+                          onClick={() => {
+                            setDiffView("unified");
+                            localStorage.setItem("diffscape-diff-view", "unified");
+                          }}
+                          title={t("unifiedDiff")}
                         >
                           <FileDiff size={14} />
                         </button>
                         <button
                           className={diffView === "split" ? "active" : ""}
-                          onClick={() => setDiffView("split")}
-                          title="Split diff"
+                          onClick={() => {
+                            setDiffView("split");
+                            localStorage.setItem("diffscape-diff-view", "split");
+                          }}
+                          title={t("splitDiff")}
                         >
                           <PanelLeftClose size={14} />
                         </button>
@@ -926,7 +974,7 @@ export default function App() {
                       {diffMode === "total"
                         ? `${t("base")}: ${selectedFile.worktree.base?.slice(0, 8) ?? "—"}`
                         : selectedFile.file.staged && selectedFile.file.unstaged
-                          ? "Staged + unstaged"
+                          ? t("stagedAndUnstaged")
                           : selectedFile.file.staged
                             ? t("staged")
                             : selectedFile.file.untracked
@@ -977,7 +1025,12 @@ export default function App() {
                       <i
                         className={`status-dot ${statusClasses[selectedFile.file.status] ?? "status-modified"}`}
                       />
-                      {selectedFile.file.status}
+                      {selectedFile.file.status === "untracked"
+                        ? t("untrackedStatus")
+                        : t(
+                            selectedFile.file.status as
+                              "modified" | "added" | "deleted" | "renamed" | "unmerged",
+                          )}
                     </span>
                     <span>
                       {selectedFile.file.staged && (
@@ -995,7 +1048,7 @@ export default function App() {
                     </span>
                     <span className="line-count">
                       {diffContent.split("\n").length > 1
-                        ? `${diffContent.split("\n").length - 1} lines`
+                        ? `${diffContent.split("\n").length - 1} ${t("lines")}`
                         : "—"}
                     </span>
                   </div>
@@ -1007,7 +1060,7 @@ export default function App() {
                     <ArrowDown size={15} />
                   </div>
                   <span>{t("selectFile")}</span>
-                  <small>Select a change from the list to inspect it.</small>
+                  <small>{t("selectChange")}</small>
                 </div>
               )}
             </section>
@@ -1016,7 +1069,7 @@ export default function App() {
             <div className="toast-error" role="alert">
               <CircleHelp size={15} />
               {repoError}
-              <button onClick={() => setRepoError("")} aria-label="Dismiss">
+              <button onClick={() => setRepoError("")} aria-label={t("dismiss")}>
                 <X size={14} />
               </button>
             </div>
@@ -1031,15 +1084,15 @@ export default function App() {
             </span>
             <span className="statusbar-right">
               <ArrowUp size={11} />
-              <ArrowDown size={11} /> Navigate <kbd>↑</kbd>
+              <ArrowDown size={11} /> {t("navigate")} <kbd>↑</kbd>
               <kbd>↓</kbd>
               <span className="statusbar-divider" />
               <span>
                 {loading
                   ? t("syncing")
                   : lastUpdated
-                    ? `Updated ${new Date(lastUpdated).toLocaleTimeString(language === "hi" ? "hi-IN" : "en-US", { hour: "numeric", minute: "2-digit" })}`
-                    : "Ready"}
+                    ? `${t("updated")} ${new Date(lastUpdated).toLocaleTimeString(language === "hi" ? "hi-IN" : "en-US", { hour: "numeric", minute: "2-digit" })}`
+                    : t("ready")}
               </span>
             </span>
           </footer>
@@ -1058,6 +1111,7 @@ function FileTreeView({
   collapsedSharedPaths,
   setCollapsedSharedPaths,
   worktreeLabel,
+  worktreesLabel,
 }: {
   nodes: FileTreeNode[];
   selectedId: string | null;
@@ -1067,6 +1121,7 @@ function FileTreeView({
   collapsedSharedPaths: Set<string>;
   setCollapsedSharedPaths: React.Dispatch<React.SetStateAction<Set<string>>>;
   worktreeLabel: (worktree: Worktree) => string;
+  worktreesLabel: string;
 }) {
   return (
     <>
@@ -1110,6 +1165,7 @@ function FileTreeView({
                     collapsedSharedPaths={collapsedSharedPaths}
                     setCollapsedSharedPaths={setCollapsedSharedPaths}
                     worktreeLabel={worktreeLabel}
+                    worktreesLabel={worktreesLabel}
                   />
                 </div>
               )}
@@ -1144,7 +1200,7 @@ function FileTreeView({
                 <FileCode2 size={14} className="file-glyph" />
                 <span className="tree-name">{node.name}</span>
                 <small className="tree-group-count">
-                  {node.entries.length} worktrees
+                  {node.entries.length} {worktreesLabel}
                 </small>
               </button>
               {!hidden && (

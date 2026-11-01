@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   aggregateCounts,
   buildFileTree,
+  filterTreeEntries,
   samePathGroups,
   sortWorktreesByObservedActivity,
 } from "./contracts";
@@ -91,6 +92,31 @@ describe("cross-worktree aggregation", () => {
     expect(
       tree[0]?.children[0]?.children[0]?.entries.map(row => row.worktree.branch),
     ).toEqual(["feature", "main"]);
+  });
+
+  it("searches old rename names and filters each change state independently", () => {
+    const renamed = makeWorktree("main", "src/new name.ts", "main::src/new name.ts");
+    renamed.files[0]!.oldPath = "src/old name.ts";
+    renamed.files[0]!.status = "renamed";
+    const committedOnly = makeWorktree(
+      "feature",
+      "src/history.ts",
+      "feature::src/history.ts",
+    );
+    committedOnly.files[0]!.staged = false;
+    committedOnly.files[0]!.unstaged = false;
+    committedOnly.files[0]!.committed = true;
+    const rows = [renamed, committedOnly].flatMap(w =>
+      samePathGroups([w]).flatMap(g =>
+        g.entries.map(entry => ({ ...entry, shared: false })),
+      ),
+    );
+    expect(
+      filterTreeEntries(rows, "old name", "all", "all").map(row => row.file.path),
+    ).toEqual(["src/new name.ts"]);
+    expect(filterTreeEntries(rows, "", "renamed", "staged")).toHaveLength(1);
+    expect(filterTreeEntries(rows, "", "all", "committed")).toHaveLength(2);
+    expect(filterTreeEntries(rows, "", "modified", "all")).toHaveLength(1);
   });
 
   it("sorts only observed activity newest-first and leaves unobserved worktrees last", () => {

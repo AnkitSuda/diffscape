@@ -123,3 +123,23 @@ export const sortWorktreesByObservedActivity = (worktrees: Worktree[]) =>
       (b.lastObservedChangeAt ?? -1) - (a.lastObservedChangeAt ?? -1) ||
       a.path.localeCompare(b.path),
   );
+
+export type ChangeScope = "all" | "staged" | "unstaged" | "untracked" | "committed";
+
+export const filterTreeEntries = (
+  rows: TreeEntry[],
+  query: string,
+  status: string,
+  scope: ChangeScope,
+) => {
+  const needle = query.trim().toLocaleLowerCase();
+  return rows.filter(({ file }) => {
+    const matchesQuery =
+      !needle ||
+      file.path.toLocaleLowerCase().includes(needle) ||
+      (file.oldPath?.toLocaleLowerCase().includes(needle) ?? false);
+    const matchesStatus = status === "all" || file.status === status;
+    const matchesScope = scope === "all" || file[scope];
+    return matchesQuery && matchesStatus && matchesScope;
+  });
+};

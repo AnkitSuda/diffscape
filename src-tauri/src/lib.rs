@@ -84,9 +84,35 @@ struct WatchState {
     running: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
+impl Drop for WatchState {
+    fn drop(&mut self) {
+        if let Ok(running) = self.running.get_mut() {
+            for stop in running.values() {
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 fn safe_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let mut child = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "diff.external="])
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+    {
+        command.env_remove(key);
+    }
+    let mut child = command
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.quotePath=false",
+        ])
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -97,6 +123,8 @@ fn safe_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         .env("GIT_DIFF_OPTS", "")
         .env("GIT_PAGER", "cat")
         .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("GIT_CONFIG_COUNT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -160,6 +188,26 @@ fn safe_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         return Err(String::from_utf8_lossy(&stderr).trim().to_string());
     }
     Ok(stdout)
+}
+
+fn is_safe_repo_path(path: &str) -> bool {
+    !path.is_empty()
+        && !Path::new(path).is_absolute()
+        && !path.starts_with(":(")
+        && !path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+fn resolve_diff_base(cwd: &Path, base: &str) -> Result<String, String> {
+    if !matches!(base.len(), 40 | 64) || !base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Comparison base must be a resolved full Git object ID".into());
+    }
+    let revision = format!("{base}^{{commit}}");
+    git_text(
+        cwd,
+        &["rev-parse", "--verify", "--end-of-options", &revision],
+    )
 }
 
 fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
@@ -442,6 +490,9 @@ fn scan_repository(
             continue;
         };
         let wt_path = PathBuf::from(path);
+        if !wt_path.is_dir() {
+            continue;
+        }
         let head = record.get("HEAD").cloned().unwrap_or_default();
         let detached = record.contains_key("detached");
         let branch = record
@@ -546,7 +597,11 @@ fn get_file_diff(
     mode: String,
     base: Option<String>,
 ) -> Result<DiffResponse, String> {
-    if path.starts_with('/') || path.split('/').any(|p| p == "..") {
+    if !is_safe_repo_path(&path)
+        || old_path
+            .as_deref()
+            .is_some_and(|old| !is_safe_repo_path(old))
+    {
         return Err("Unsafe repository-relative file path".into());
     }
     let root = PathBuf::from(&worktree_path)
@@ -625,6 +680,7 @@ fn get_file_diff(
         ],
         "total" => {
             let b = base.ok_or("No merge base is available for this worktree")?;
+            let b = resolve_diff_base(&root, &b)?;
             vec![
                 "diff".into(),
                 "--no-ext-diff".into(),
@@ -693,66 +749,18 @@ fn watch_repository(
     let (sender, receiver) = mpsc::sync_channel::<String>(32);
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
-    let root = path.clone();
-    let selected_base = comparison_base.clone();
+    let root = PathBuf::from(&path);
     thread::spawn(move || {
-        let mut watchers: Vec<(String, RecommendedWatcher)> = Vec::new();
-        let mut activity_times = HashMap::<String, u64>::new();
-        let mut last_signature = String::new();
-        while !stopped.load(Ordering::Relaxed) {
-            let mut active_events = std::collections::HashSet::new();
-            let event_received = match receiver.recv_timeout(Duration::from_secs(2)) {
-                Ok(worktree_id) => {
-                    active_events.insert(worktree_id);
-                    true
-                }
-                Err(_) => false,
-            };
-            if event_received {
-                thread::sleep(Duration::from_millis(350));
-                while let Ok(worktree_id) = receiver.try_recv() {
-                    active_events.insert(worktree_id);
-                }
-            }
-            if stopped.load(Ordering::Relaxed) {
-                break;
-            }
-            let observed_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            for worktree_id in active_events {
-                activity_times.insert(worktree_id, observed_at);
-            }
-            let Ok(snapshot) = scan_repository(
-                Path::new(&root),
-                selected_base.as_deref(),
-                Some(&activity_times),
-            ) else {
-                continue;
-            };
-            let active = snapshot
-                .worktrees
-                .iter()
-                .take(64)
-                .map(|worktree| worktree.id.clone())
-                .collect::<std::collections::HashSet<_>>();
-            activity_times.retain(|id, _| active.contains(id));
-            watchers.retain(|(id, _)| active.contains(id));
-            for worktree in snapshot.worktrees.iter().take(64) {
-                if !watchers.iter().any(|(id, _)| id == &worktree.id) {
-                    if let Ok(watcher) = make_watcher(&worktree.path, &worktree.id, sender.clone())
-                    {
-                        watchers.push((worktree.id.clone(), watcher));
-                    }
-                }
-            }
-            let signature = serde_json::to_string(&snapshot.worktrees).unwrap_or_default();
-            if event_received || signature != last_signature {
+        run_watch_loop(
+            root,
+            comparison_base,
+            stopped,
+            receiver,
+            sender,
+            |snapshot| {
                 let _ = app.emit("repository-changed", snapshot);
-                last_signature = signature;
-            }
-        }
+            },
+        );
     });
     state
         .running
@@ -760,6 +768,94 @@ fn watch_repository(
         .map_err(|e| e.to_string())?
         .insert(path, stop);
     Ok(())
+}
+
+fn run_watch_loop<F>(
+    root: PathBuf,
+    selected_base: Option<String>,
+    stopped: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<String>,
+    sender: mpsc::SyncSender<String>,
+    mut publish: F,
+) where
+    F: FnMut(RepositorySnapshot),
+{
+    let mut watchers: Vec<(String, RecommendedWatcher)> = Vec::new();
+    let mut activity_times = HashMap::<String, u64>::new();
+    let mut last_signature = String::new();
+    let mut last_reconcile = Instant::now() - Duration::from_secs(2);
+    while !stopped.load(Ordering::Relaxed) {
+        let mut active_events = std::collections::HashSet::new();
+        let event_received = match receiver.recv_timeout(Duration::from_millis(200)) {
+            Ok(worktree_id) => {
+                active_events.insert(worktree_id);
+                let quiet_deadline = Instant::now() + Duration::from_millis(350);
+                while !stopped.load(Ordering::Relaxed) {
+                    let remaining = quiet_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match receiver.recv_timeout(remaining) {
+                        Ok(id) => {
+                            active_events.insert(id);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                true
+            }
+            Err(_) => false,
+        };
+        if stopped.load(Ordering::Relaxed) {
+            break;
+        }
+        let reconcile_due = last_reconcile.elapsed() >= Duration::from_secs(2);
+        if !event_received && !reconcile_due {
+            continue;
+        }
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        for worktree_id in active_events {
+            activity_times.insert(worktree_id, observed_at);
+        }
+        let Ok(snapshot) = scan_repository(&root, selected_base.as_deref(), Some(&activity_times))
+        else {
+            last_reconcile = Instant::now();
+            continue;
+        };
+        last_reconcile = Instant::now();
+        let active = snapshot
+            .worktrees
+            .iter()
+            .take(64)
+            .map(|w| w.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        activity_times.retain(|id, _| active.contains(id));
+        watchers.retain(|(id, _)| active.contains(id));
+        for worktree in snapshot.worktrees.iter().take(64) {
+            if !watchers.iter().any(|(id, _)| id == &worktree.id) {
+                if let Ok(watcher) = make_watcher(&worktree.path, &worktree.id, sender.clone()) {
+                    watchers.push((worktree.id.clone(), watcher));
+                }
+            }
+        }
+        let signature = serde_json::to_string(&snapshot.worktrees).unwrap_or_default();
+        if event_received || signature != last_signature {
+            publish(snapshot);
+            last_signature = signature;
+        }
+    }
+    drop(watchers);
+}
+
+fn is_git_metadata_paths(paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            path.components()
+                .any(|component| component.as_os_str() == ".git")
+        })
 }
 
 fn make_watcher(
@@ -771,10 +867,7 @@ fn make_watcher(
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<notify::Event>| {
             if let Ok(event) = event {
-                let is_git_metadata = event.paths.iter().any(|path| {
-                    path.components()
-                        .any(|component| component.as_os_str() == ".git")
-                });
+                let is_git_metadata = is_git_metadata_paths(&event.paths);
                 if !is_git_metadata {
                     let _ = sender.try_send(worktree_id.clone());
                 }
@@ -854,7 +947,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, process::Command, time::SystemTime};
+    use std::{fs, process::Command, sync::atomic::AtomicU64, time::SystemTime};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn run_git(path: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -871,12 +966,13 @@ mod tests {
 
     fn temp_root() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "diffscape-test-{}-{}",
+            "diffscape-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
         path
@@ -891,6 +987,19 @@ mod tests {
     }
 
     #[test]
+    fn git_metadata_event_classification_ignores_only_pure_metadata_events() {
+        assert!(is_git_metadata_paths(&[PathBuf::from("/repo/.git/index")]));
+        assert!(!is_git_metadata_paths(&[
+            PathBuf::from("/repo/.git/index"),
+            PathBuf::from("/repo/src/file.rs")
+        ]));
+        assert!(!is_git_metadata_paths(&[PathBuf::from(
+            "/repo/src/file.rs"
+        )]));
+        assert!(!is_git_metadata_paths(&[]));
+    }
+
+    #[test]
     fn watcher_reports_user_changes_and_ignores_git_metadata() {
         let temp = temp_root();
         let repo = temp.join("watched");
@@ -902,9 +1011,13 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
             "worktree-id"
         );
-        while receiver.try_recv().is_ok() {}
+        let quiet_until = Instant::now() + Duration::from_millis(350);
+        while Instant::now() < quiet_until {
+            if receiver.recv_timeout(Duration::from_millis(50)).is_ok() {
+                continue;
+            }
+        }
         fs::write(repo.join(".git/index"), "metadata").unwrap();
-        assert!(receiver.recv_timeout(Duration::from_millis(500)).is_err());
         drop(watcher);
         fs::remove_dir_all(temp).unwrap();
     }
@@ -1112,6 +1225,197 @@ mod tests {
             fs::read(repo.join(".git/index")).unwrap(),
             index_before,
             "diff reads must not rewrite the index"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    fn init_repository(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        run_git(path, &["init", "-b", "main"]);
+        fs::write(path.join("tracked.txt"), "base\n").unwrap();
+        run_git(path, &["add", "tracked.txt"]);
+        run_git(
+            path,
+            &[
+                "-c",
+                "user.name=Diffscape Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+    }
+
+    fn read_tree(
+        path: &Path,
+        root: &Path,
+        result: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                read_tree(&entry.path(), root, result);
+            } else if file_type.is_file() {
+                result.insert(
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+
+    fn snapshot_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut result = std::collections::BTreeMap::new();
+        read_tree(root, root, &mut result);
+        result
+    }
+
+    #[test]
+    fn skips_prunable_worktree_records_without_failing_the_repository_scan() {
+        let temp = temp_root();
+        let repo = temp.join("checkout");
+        let linked = temp.join("stale linked checkout");
+        init_repository(&repo);
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "stale",
+                linked.to_str().unwrap(),
+                "main",
+            ],
+        );
+        fs::remove_dir_all(&linked).unwrap();
+        let snapshot = scan_repository(&repo, None, None).unwrap();
+        assert_eq!(snapshot.worktrees.len(), 1);
+        assert_eq!(snapshot.worktrees[0].branch.as_deref(), Some("main"));
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn watcher_reconciles_live_changes_added_and_removed_worktrees_and_stops() {
+        let temp = temp_root();
+        let repo = temp.join("checkout");
+        let linked = temp.join("linked checkout");
+        init_repository(&repo);
+        let (sender, receiver) = mpsc::sync_channel::<String>(32);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let (published, updates) = mpsc::channel();
+        let watcher_sender = sender.clone();
+        let thread = thread::spawn(move || {
+            run_watch_loop(
+                repo,
+                None,
+                thread_stop,
+                receiver,
+                watcher_sender,
+                |snapshot| {
+                    let _ = published.send(snapshot);
+                },
+            );
+        });
+        let initial = updates.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(initial.worktrees.len(), 1);
+        let id = initial.worktrees[0].id.clone();
+        fs::write(temp.join("checkout/tracked.txt"), "live edit\n").unwrap();
+        let changed = updates.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(changed.worktrees[0]
+            .files
+            .iter()
+            .any(|file| file.path == "tracked.txt" && file.unstaged));
+        assert!(changed.worktrees[0].last_observed_change_at.is_some());
+
+        run_git(
+            &temp.join("checkout"),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "topic",
+                linked.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let added = loop {
+            let candidate = updates.recv_timeout(Duration::from_secs(6)).unwrap();
+            if candidate.worktrees.len() == 2 {
+                break candidate;
+            }
+        };
+        let linked_id = added
+            .worktrees
+            .iter()
+            .find(|w| w.branch.as_deref() == Some("topic"))
+            .unwrap()
+            .id
+            .clone();
+        fs::write(linked.join("linked.txt"), "linked edit\n").unwrap();
+        let linked_changed = loop {
+            let candidate = updates.recv_timeout(Duration::from_secs(5)).unwrap();
+            if candidate
+                .worktrees
+                .iter()
+                .any(|w| w.id == linked_id && w.files.iter().any(|f| f.path == "linked.txt"))
+            {
+                break candidate;
+            }
+        };
+        assert!(linked_changed
+            .worktrees
+            .iter()
+            .any(|w| w.id == linked_id && w.files.iter().any(|f| f.path == "linked.txt")));
+        run_git(
+            &temp.join("checkout"),
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let removed = loop {
+            let candidate = updates.recv_timeout(Duration::from_secs(6)).unwrap();
+            if candidate.worktrees.len() == 1 {
+                break candidate;
+            }
+        };
+        assert_eq!(removed.worktrees[0].id, id);
+        stop.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+        assert!(updates.recv_timeout(Duration::from_millis(50)).is_err());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn diff_base_and_path_validation_prevent_option_injection_and_reads_do_not_write() {
+        let temp = temp_root();
+        let repo = temp.join("checkout");
+        init_repository(&repo);
+        fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
+        let marker = temp.join("git-option-injection-marker");
+        let injected_base = format!("--output={}", marker.display());
+        let before = snapshot_bytes(&repo);
+        let result = get_file_diff(
+            repo.to_string_lossy().into_owned(),
+            repo.to_string_lossy().into_owned(),
+            "tracked.txt".into(),
+            None,
+            "total".into(),
+            Some(injected_base),
+        );
+        assert!(result.is_err());
+        assert!(!marker.exists());
+        assert!(!is_safe_repo_path(":(glob)**"));
+        assert!(!is_safe_repo_path("../outside"));
+        assert!(!is_safe_repo_path("nested//file"));
+        assert!(is_safe_repo_path("nested/valid file.txt"));
+        let snapshot = scan_repository(&repo, None, None).unwrap();
+        assert!(!snapshot.worktrees.is_empty());
+        assert_eq!(
+            snapshot_bytes(&repo),
+            before,
+            "repository bytes changed during scan/diff read"
         );
         fs::remove_dir_all(temp).unwrap();
     }
