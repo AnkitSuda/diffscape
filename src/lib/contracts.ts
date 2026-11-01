@@ -28,10 +28,16 @@ export interface Worktree {
   unstagedCount: number;
   untrackedCount: number;
   committedCount: number;
+  lastObservedChangeAt: number | null;
 }
 
 export interface RepositorySnapshot {
   root: string;
+  availableBases: string[];
+  comparisonBase: string | null;
+  comparisonBaseOid: string | null;
+  comparisonBaseIsManual: boolean;
+  comparisonBaseError: string | null;
   worktrees: Worktree[];
   scannedAt: number;
 }
@@ -61,6 +67,42 @@ export const samePathGroups = (worktrees: Worktree[]) => {
   return [...groups.entries()].map(([path, entries]) => ({ path, entries }));
 };
 
+export type TreeEntry = { worktree: Worktree; file: WorktreeFile; shared: boolean };
+export type FileTreeNode = {
+  name: string;
+  path: string;
+  children: FileTreeNode[];
+  entries: TreeEntry[];
+};
+
+export const buildFileTree = (rows: TreeEntry[]): FileTreeNode[] => {
+  const roots: FileTreeNode[] = [];
+  for (const row of rows) {
+    const segments = row.file.path.split("/").filter(Boolean);
+    let siblings = roots;
+    let currentPath = "";
+    segments.forEach((segment, index) => {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      let node = siblings.find(child => child.name === segment);
+      if (!node) {
+        node = { name: segment, path: currentPath, children: [], entries: [] };
+        siblings.push(node);
+      }
+      if (index === segments.length - 1) node.entries.push(row);
+      else siblings = node.children;
+    });
+  }
+  const sort = (nodes: FileTreeNode[]) => {
+    nodes.sort((a, b) => a.name.localeCompare(b.name));
+    for (const node of nodes) {
+      node.entries.sort((a, b) => a.worktree.path.localeCompare(b.worktree.path));
+      sort(node.children);
+    }
+  };
+  sort(roots);
+  return roots;
+};
+
 export const aggregateCounts = (worktrees: Worktree[]) => ({
   uniquePaths: new Set(
     worktrees.flatMap(worktree => worktree.files.map(file => file.path)).values(),
@@ -74,3 +116,10 @@ export const aggregateCounts = (worktrees: Worktree[]) => ({
   untracked: worktrees.reduce((total, worktree) => total + worktree.untrackedCount, 0),
   committed: worktrees.reduce((total, worktree) => total + worktree.committedCount, 0),
 });
+
+export const sortWorktreesByObservedActivity = (worktrees: Worktree[]) =>
+  [...worktrees].sort(
+    (a, b) =>
+      (b.lastObservedChangeAt ?? -1) - (a.lastObservedChangeAt ?? -1) ||
+      a.path.localeCompare(b.path),
+  );

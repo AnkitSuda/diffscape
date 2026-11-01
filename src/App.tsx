@@ -6,41 +6,51 @@ import {
   sendNotification,
 } from "@tauri-apps/plugin-notification";
 import {
-  Activity,
   ArrowDown,
   ArrowUp,
   Bell,
-  Check,
   ChevronDown,
   CircleHelp,
-  Clock3,
   Command,
   FileCode2,
   FileDiff,
+  Folder,
   FolderOpen,
   GitBranch,
-  GitCommitHorizontal,
   GitFork,
   Languages,
   PanelLeftClose,
+  ChevronRight,
   RefreshCw,
   Search,
   Settings2,
-  Sparkles,
   Workflow,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import type {
   DiffMode,
   Language,
   RepositorySnapshot,
   Worktree,
   WorktreeFile,
+  FileTreeNode,
+  TreeEntry,
 } from "./lib/contracts";
-import { aggregateCounts, samePathGroups } from "./lib/contracts";
+import {
+  aggregateCounts,
+  buildFileTree,
+  samePathGroups,
+  sortWorktreesByObservedActivity,
+} from "./lib/contracts";
 import { gitApi, isNative } from "./lib/git";
 import { translate } from "./lib/i18n";
+import { demoSnapshot } from "./lib/demo";
+
+const demoPreviewEnabled =
+  import.meta.env.DEV &&
+  new URLSearchParams(window.location.search).get("preview") === "demo";
 
 const statusClasses: Record<string, string> = {
   modified: "status-modified",
@@ -52,12 +62,26 @@ const statusClasses: Record<string, string> = {
 };
 
 export default function App() {
-  const [snapshot, setSnapshot] = useState<RepositorySnapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<RepositorySnapshot | null>(() =>
+    demoPreviewEnabled ? demoSnapshot : null,
+  );
   const [repoError, setRepoError] = useState("");
   const [loading, setLoading] = useState(false);
   const [selectedWorktree, setSelectedWorktree] = useState<string>("all");
-  const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
+  const [selectedFileId, setSelectedFileId] = useState<string | null>(() =>
+    demoPreviewEnabled ? (demoSnapshot.worktrees[0]?.files[0]?.id ?? null) : null,
+  );
   const [diffMode, setDiffMode] = useState<DiffMode>("working");
+  const [commitInput, setCommitInput] = useState("");
+  const [worktreeSort, setWorktreeSort] = useState<"branch" | "activity">("branch");
+  const [collapsedDirectories, setCollapsedDirectories] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [collapsedSharedPaths, setCollapsedSharedPaths] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [sidebarWidth, setSidebarWidth] = useState(220);
+  const [listWidth, setListWidth] = useState(320);
   const [diffState, setDiffState] = useState<{
     key: string;
     content: string;
@@ -68,7 +92,6 @@ export default function App() {
   const [language, setLanguage] = useState<Language>(() =>
     localStorage.getItem("diffscape-language") === "hi" ? "hi" : "en",
   );
-  const [showTimeline, setShowTimeline] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [watching, setWatching] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -82,11 +105,24 @@ export default function App() {
   const snapshotRequestRef = useRef(0);
   const notificationPreferenceRef = useRef(notifications);
   const changeSignatureRef = useRef<string | null>(null);
+  const resizeRef = useRef<{
+    pane: "sidebar" | "list";
+    startX: number;
+    startWidth: number;
+  } | null>(null);
   const t = (key: Parameters<typeof translate>[1]) => translate(language, key);
 
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const appearance = new URLSearchParams(window.location.search).get("appearance");
+    if (appearance === "dark" || appearance === "light")
+      document.documentElement.dataset.appearance = appearance;
+    else delete document.documentElement.dataset.appearance;
+  }, []);
 
   const applySnapshot = useCallback((next: RepositorySnapshot) => {
     const accepted = snapshotRef.current;
@@ -139,7 +175,11 @@ export default function App() {
         const ticket = ++snapshotRequestRef.current;
         setLoading(true);
         setRepoError("");
-        const next = await gitApi.open(chosen);
+        const initial = await gitApi.open(chosen, null);
+        const savedBase = localStorage.getItem(`diffscape-base:${initial.root}`);
+        const next = savedBase
+          ? await gitApi.refresh(initial.root, savedBase)
+          : initial;
         if (ticket !== snapshotRequestRef.current) return;
         applySnapshot(next);
         localStorage.setItem("diffscape-last-repository", next.root);
@@ -158,7 +198,10 @@ export default function App() {
     const ticket = ++snapshotRequestRef.current;
     setLoading(true);
     try {
-      const next = await gitApi.refresh(snapshot.root);
+      const next = await gitApi.refresh(
+        snapshot.root,
+        snapshot.comparisonBaseIsManual ? snapshot.comparisonBase : null,
+      );
       if (ticket === snapshotRequestRef.current) applySnapshot(next);
     } catch (error) {
       setRepoError(String(error));
@@ -166,6 +209,23 @@ export default function App() {
       setLoading(false);
     }
   }, [applySnapshot, snapshot]);
+
+  const changeComparisonBase = async (base: string | null) => {
+    if (!snapshot) return;
+    const ticket = ++snapshotRequestRef.current;
+    if (base) localStorage.setItem(`diffscape-base:${snapshot.root}`, base);
+    else localStorage.removeItem(`diffscape-base:${snapshot.root}`);
+    setLoading(true);
+    setRepoError("");
+    try {
+      const next = await gitApi.refresh(snapshot.root, base);
+      if (ticket === snapshotRequestRef.current) applySnapshot(next);
+    } catch (error) {
+      if (ticket === snapshotRequestRef.current) setRepoError(String(error));
+    } finally {
+      if (ticket === snapshotRequestRef.current) setLoading(false);
+    }
+  };
 
   useEffect(() => {
     const remembered = localStorage.getItem("diffscape-last-repository");
@@ -175,18 +235,26 @@ export default function App() {
   }, [openRepo]);
 
   const repositoryRoot = snapshot?.root;
+  const selectedBase = snapshot?.comparisonBaseIsManual
+    ? snapshot.comparisonBase
+    : null;
   useEffect(() => {
     if (!repositoryRoot || !isNative) return;
     let unlisten: (() => void) | undefined;
     let active = true;
     void gitApi
-      .watch(repositoryRoot)
-      .then(() => setWatching(true))
-      .catch(() => setWatching(false));
+      .watch(repositoryRoot, selectedBase)
+      .then(() => {
+        if (active) setWatching(true);
+      })
+      .catch(() => {
+        if (active) setWatching(false);
+      });
     void listen<RepositorySnapshot>("repository-changed", event => {
       if (active && event.payload.root === repositoryRoot) applySnapshot(event.payload);
     }).then(fn => {
-      unlisten = fn;
+      if (active) unlisten = fn;
+      else fn();
     });
     return () => {
       active = false;
@@ -194,7 +262,7 @@ export default function App() {
       void gitApi.stop(repositoryRoot).catch(() => undefined);
       setWatching(false);
     };
-  }, [repositoryRoot, applySnapshot]);
+  }, [repositoryRoot, selectedBase, applySnapshot]);
 
   const filteredWorktrees = useMemo(
     () =>
@@ -224,6 +292,20 @@ export default function App() {
         ),
     [groups, query, statusFilter],
   );
+  const fileTree = useMemo(() => buildFileTree(rows), [rows]);
+  const sortedWorktrees = useMemo(() => {
+    const list = [...(snapshot?.worktrees ?? [])];
+    if (worktreeSort === "activity") {
+      return sortWorktreesByObservedActivity(list);
+    } else {
+      list.sort(
+        (a, b) =>
+          Number(b.isMain) - Number(a.isMain) ||
+          (a.branch ?? a.path).localeCompare(b.branch ?? b.path),
+      );
+    }
+    return list;
+  }, [snapshot, worktreeSort]);
   const selectedFile = rows.find(row => row.file.id === selectedFileId) ?? null;
   const worktree = snapshot?.worktrees.find(w => w.id === selectedFile?.worktree.id);
   const diffKey =
@@ -270,6 +352,37 @@ export default function App() {
 
   const selectRow = (row: { worktree: Worktree; file: WorktreeFile }) =>
     setSelectedFileId(row.file.id);
+
+  useEffect(() => {
+    const move = (event: PointerEvent) => {
+      const resize = resizeRef.current;
+      if (!resize) return;
+      const delta = event.clientX - resize.startX;
+      if (resize.pane === "sidebar")
+        setSidebarWidth(Math.max(160, Math.min(340, resize.startWidth + delta)));
+      else setListWidth(Math.max(240, Math.min(520, resize.startWidth + delta)));
+    };
+    const end = () => {
+      resizeRef.current = null;
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+    };
+  }, []);
+  const beginResize = (
+    pane: "sidebar" | "list",
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    event.preventDefault();
+    resizeRef.current = {
+      pane,
+      startX: event.clientX,
+      startWidth: pane === "sidebar" ? sidebarWidth : listWidth,
+    };
+  };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement;
@@ -338,25 +451,27 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <header className="topbar">
-        <div className="brand-lockup">
-          <div className="brand-mark">
-            <Workflow size={19} strokeWidth={2.2} />
-          </div>
-          <span className="brand-name">Diffscape</span>
-          <span className="brand-tag">WORKTREE STUDIO</span>
-        </div>
-        <div className="topbar-center">
-          <span className="breadcrumb-root">
-            {snapshot?.root ?? "Your Git workspace"}
+      <header
+        className={`topbar ${isNative ? "native-titlebar" : ""}`}
+        data-tauri-drag-region
+      >
+        <div className="toolbar-title" data-tauri-drag-region>
+          {!isNative && <span className="brand-name">Diffscape</span>}
+          <span className="breadcrumb-root" title={snapshot?.root ?? ""}>
+            {snapshot?.root ?? "No Repository Open"}
           </span>
-          {snapshot && (
-            <span className="repo-badge">
-              <GitFork size={12} /> {snapshot.worktrees.length} worktrees
-            </span>
-          )}
         </div>
-        <div className="topbar-actions">
+        <div className="topbar-actions" data-tauri-drag-region="false">
+          {snapshot && (
+            <button
+              className="icon-button"
+              onClick={() => setSidebarOpen(value => !value)}
+              aria-label={sidebarOpen ? "Hide worktrees" : "Show worktrees"}
+              title={sidebarOpen ? "Hide worktrees" : "Show worktrees"}
+            >
+              <PanelLeftClose size={15} />
+            </button>
+          )}
           {snapshot && isNative && (
             <button
               className={`icon-button ${notifications ? "notification-on" : ""}`}
@@ -386,53 +501,28 @@ export default function App() {
           >
             <Languages size={15} /> {language === "en" ? "EN" : "हि"}
           </button>
-          <button className="primary-button" onClick={() => void openRepo()}>
-            <FolderOpen size={15} /> {t("open")}
+          <button
+            className="toolbar-button"
+            onClick={() => void openRepo()}
+            title={t("open")}
+          >
+            <FolderOpen size={15} />
+            <span>{t("open")}</span>
           </button>
         </div>
       </header>
 
       {!snapshot ? (
         <section className="welcome-screen">
-          <div className="welcome-art" aria-hidden="true">
-            <div className="art-orbit orbit-one" />
-            <div className="art-orbit orbit-two" />
-            <div className="art-center">
-              <Workflow size={48} />
-            </div>
-            <div className="art-node node-a">
-              <GitBranch size={16} />
-            </div>
-            <div className="art-node node-b">
-              <FileDiff size={16} />
-            </div>
-            <div className="art-node node-c">
-              <GitCommitHorizontal size={17} />
-            </div>
-          </div>
-          <div className="welcome-eyebrow">
-            <Sparkles size={13} /> BUILT FOR THE WAY YOU BRANCH
-          </div>
           <h1>{t("emptyTitle")}</h1>
           <p>{t("emptyText")}</p>
           <button
-            className="primary-button welcome-button"
+            className="toolbar-button welcome-button"
             onClick={() => void openRepo()}
           >
             <FolderOpen size={16} />
             {t("choose")}
           </button>
-          <div className="welcome-foot">
-            <span>
-              <Check size={13} /> Read-only by design
-            </span>
-            <span>
-              <GitFork size={13} /> All worktrees, one view
-            </span>
-            <span>
-              <Activity size={13} /> Local and private
-            </span>
-          </div>
           {repoError && (
             <div className="error-banner" role="alert">
               <CircleHelp size={15} />
@@ -442,64 +532,85 @@ export default function App() {
         </section>
       ) : (
         <>
-          <section className="overview-strip">
-            <div className="overview-label">
-              <span className="overline">{t("overview")}</span>
-              <span className="overview-title">
-                {snapshot.root.split(/[\\/]/).filter(Boolean).at(-1)}
-              </span>
-            </div>
-            <div className="overview-stat">
-              <span className="stat-number">{counts.uniquePaths}</span>
-              <span className="stat-caption">{t("uniquePaths")}</span>
-            </div>
-            <div className="overview-stat">
-              <span className="stat-number">{counts.worktreeFileChanges}</span>
-              <span className="stat-caption">{t("fileChanges")}</span>
-            </div>
-            <div className="overview-breakdown">
-              <span>
-                <i className="dot dot-staged" />
-                {t("staged")} <b>{counts.staged}</b>
-              </span>
-              <span>
-                <i className="dot dot-unstaged" />
-                {t("unstaged")} <b>{counts.unstaged}</b>
-              </span>
-              <span>
-                <i className="dot dot-untracked" />
-                {t("untracked")} <b>{counts.untracked}</b>
-              </span>
-              <span>
-                <i className="dot dot-committed" />
-                {t("committed")} <b>{counts.committed}</b>
-              </span>
-            </div>
-            <button
-              className={`timeline-toggle ${showTimeline ? "active" : ""}`}
-              onClick={() => setShowTimeline(value => !value)}
+          <section className="comparison-toolbar" aria-label={t("comparisonBase")}>
+            <label>
+              {t("comparisonBase")}
+              <select
+                value={
+                  snapshot.comparisonBaseIsManual
+                    ? (snapshot.comparisonBase ?? "")
+                    : "__default__"
+                }
+                onChange={event =>
+                  void changeComparisonBase(
+                    event.target.value === "__default__" ? null : event.target.value,
+                  )
+                }
+              >
+                <option value="__default__">{t("defaultBase")}</option>
+                {snapshot.availableBases.map(base => (
+                  <option key={base} value={base}>
+                    {base}
+                  </option>
+                ))}
+                {snapshot.comparisonBaseIsManual &&
+                  snapshot.comparisonBase &&
+                  !snapshot.availableBases.includes(snapshot.comparisonBase) && (
+                    <option value={snapshot.comparisonBase}>
+                      {snapshot.comparisonBase}
+                    </option>
+                  )}
+              </select>
+            </label>
+            <form
+              className="commit-base-form"
+              onSubmit={event => {
+                event.preventDefault();
+                if (/^[0-9a-f]{7,64}$/i.test(commitInput))
+                  void changeComparisonBase(commitInput);
+              }}
             >
-              <Clock3 size={14} />
-              {t("timeline")}
-            </button>
+              <input
+                value={commitInput}
+                onChange={event => setCommitInput(event.target.value)}
+                placeholder={t("commitId")}
+                aria-label={t("commitId")}
+              />
+              <button
+                className="toolbar-button"
+                type="submit"
+                disabled={!/^[0-9a-f]{7,64}$/i.test(commitInput)}
+              >
+                {t("useCommit")}
+              </button>
+            </form>
+            <span
+              className="baseline-detail"
+              title={snapshot.comparisonBaseOid ?? snapshot.comparisonBaseError ?? ""}
+            >
+              {snapshot.comparisonBaseError
+                ? snapshot.comparisonBaseError
+                : `${snapshot.comparisonBase ?? "—"} · ${snapshot.comparisonBaseOid?.slice(0, 12) ?? "unresolved"}`}
+            </span>
+            <span className="aggregate-summary">
+              {counts.uniquePaths} {t("uniquePaths")} · {counts.worktreeFileChanges}{" "}
+              {t("fileChanges")}
+            </span>
           </section>
-          {showTimeline && (
-            <div className="timeline-panel">
-              <div className="timeline-mark" />
-              <div>
-                <strong>{t("live")}</strong>
-                <p>
-                  {lastUpdated
-                    ? `Repository snapshot refreshed ${new Date(lastUpdated).toLocaleTimeString(language === "hi" ? "hi-IN" : "en-US", { hour: "numeric", minute: "2-digit" })}. This is scan activity, not a commit timeline.`
-                    : "Waiting for first scan."}
-                </p>
-              </div>
-              <span className="live-pill">
-                <i /> {watching ? t("live") : t("offline")}
-              </span>
+          {snapshot.comparisonBaseError && (
+            <div className="base-error" role="alert">
+              {snapshot.comparisonBaseError}
             </div>
           )}
-          <div className="workspace">
+          <div
+            className="workspace"
+            style={
+              {
+                "--sidebar-width": sidebarOpen ? `${sidebarWidth}px` : "0px",
+                "--list-width": `${listWidth}px`,
+              } as CSSProperties
+            }
+          >
             <aside
               className={`worktree-sidebar ${sidebarOpen ? "" : "collapsed"}`}
               aria-label={t("worktrees")}
@@ -529,8 +640,20 @@ export default function App() {
               </button>
               <div className="sidebar-divider" />
               <span className="sidebar-section-label">{t("changes")}</span>
+              <label className="activity-sort">
+                {t("sortWorktrees")}
+                <select
+                  value={worktreeSort}
+                  onChange={event =>
+                    setWorktreeSort(event.target.value as "branch" | "activity")
+                  }
+                >
+                  <option value="branch">{t("sortByBranch")}</option>
+                  <option value="activity">{t("sortByActivity")}</option>
+                </select>
+              </label>
               <div className="worktree-list">
-                {snapshot.worktrees.map(worktree => (
+                {sortedWorktrees.map(worktree => (
                   <button
                     key={worktree.id}
                     className={`worktree-option ${selectedWorktree === worktree.id ? "selected" : ""}`}
@@ -561,6 +684,13 @@ export default function App() {
                               .slice(-2)
                               .join("/")}
                       </small>
+                      {worktreeSort === "activity" && (
+                        <small className="observed-time">
+                          {worktree.lastObservedChangeAt
+                            ? `${t("lastObserved")}: ${new Date(worktree.lastObservedChangeAt).toLocaleTimeString(language === "hi" ? "hi-IN" : "en-US", { hour: "numeric", minute: "2-digit" })}`
+                            : t("notObserved")}
+                        </small>
+                      )}
                     </div>
                     {worktree.worktreeFileChanges > 0 && (
                       <span className="wt-count">{worktree.worktreeFileChanges}</span>
@@ -583,6 +713,26 @@ export default function App() {
                 </span>
               </div>
             </aside>
+            <div
+              className={`pane-splitter sidebar-splitter ${sidebarOpen ? "" : "is-hidden"}`}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize worktree sidebar"
+              aria-valuenow={sidebarWidth}
+              tabIndex={sidebarOpen ? 0 : -1}
+              onPointerDown={event => beginResize("sidebar", event)}
+              onKeyDown={event => {
+                if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                  event.preventDefault();
+                  setSidebarWidth(width =>
+                    Math.max(
+                      160,
+                      Math.min(340, width + (event.key === "ArrowRight" ? 16 : -16)),
+                    ),
+                  );
+                }
+              }}
+            />
             {!sidebarOpen && (
               <button
                 className="expand-sidebar"
@@ -649,41 +799,17 @@ export default function App() {
                 <span>{t("path")}</span>
                 <span>{t("status")}</span>
               </div>
-              <div className="file-rows" role="listbox" aria-label={t("changes")}>
-                {rows.map(row => (
-                  <button
-                    key={row.file.id}
-                    role="option"
-                    aria-selected={selectedFile?.file.id === row.file.id}
-                    className={`file-row ${selectedFile?.file.id === row.file.id ? "selected" : ""}`}
-                    onClick={() => selectRow(row)}
-                  >
-                    <FileCode2 size={15} className="file-glyph" />
-                    <span className="file-name-wrap">
-                      <strong title={row.file.path}>
-                        {row.file.path.split("/").at(-1)}
-                      </strong>
-                      <small>
-                        {row.file.oldPath ? `${row.file.oldPath} → ` : ""}
-                        {row.file.path.includes("/")
-                          ? row.file.path.split("/").slice(0, -1).join("/")
-                          : "."}
-                        {selectedWorktree === "all"
-                          ? ` · ${row.worktree.branch ?? t("detached")}`
-                          : ""}
-                      </small>
-                    </span>
-                    {row.shared && (
-                      <span className="shared-marker" title={t("conflictNote")}>
-                        ↗
-                      </span>
-                    )}
-                    <span
-                      className={`status-dot ${statusClasses[row.file.status] ?? "status-modified"}`}
-                      title={row.file.status}
-                    />
-                  </button>
-                ))}
+              <div className="file-rows" role="tree" aria-label={t("changes")}>
+                <FileTreeView
+                  nodes={fileTree}
+                  selectedId={selectedFile?.file.id ?? null}
+                  onSelect={selectRow}
+                  collapsedDirectories={collapsedDirectories}
+                  setCollapsedDirectories={setCollapsedDirectories}
+                  collapsedSharedPaths={collapsedSharedPaths}
+                  setCollapsedSharedPaths={setCollapsedSharedPaths}
+                  worktreeLabel={item => item.branch ?? t("detached")}
+                />
                 {!rows.length && (
                   <div className="empty-list">
                     <div className="empty-list-icon">
@@ -706,6 +832,26 @@ export default function App() {
                 </span>
               </div>
             </section>
+            <div
+              className="pane-splitter list-splitter"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize file list"
+              aria-valuenow={listWidth}
+              tabIndex={0}
+              onPointerDown={event => beginResize("list", event)}
+              onKeyDown={event => {
+                if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                  event.preventDefault();
+                  setListWidth(width =>
+                    Math.max(
+                      240,
+                      Math.min(520, width + (event.key === "ArrowRight" ? 16 : -16)),
+                    ),
+                  );
+                }
+              }}
+            />
             <section className="diff-pane" aria-label="Diff viewer">
               {selectedFile ? (
                 <>
@@ -900,6 +1046,170 @@ export default function App() {
         </>
       )}
     </main>
+  );
+}
+
+function FileTreeView({
+  nodes,
+  selectedId,
+  onSelect,
+  collapsedDirectories,
+  setCollapsedDirectories,
+  collapsedSharedPaths,
+  setCollapsedSharedPaths,
+  worktreeLabel,
+}: {
+  nodes: FileTreeNode[];
+  selectedId: string | null;
+  onSelect: (entry: TreeEntry) => void;
+  collapsedDirectories: Set<string>;
+  setCollapsedDirectories: React.Dispatch<React.SetStateAction<Set<string>>>;
+  collapsedSharedPaths: Set<string>;
+  setCollapsedSharedPaths: React.Dispatch<React.SetStateAction<Set<string>>>;
+  worktreeLabel: (worktree: Worktree) => string;
+}) {
+  return (
+    <>
+      {nodes.map(node => {
+        const hasChildren = node.children.length > 0;
+        if (hasChildren) {
+          const collapsed = collapsedDirectories.has(node.path);
+          return (
+            <div
+              className="tree-node"
+              role="treeitem"
+              aria-expanded={!collapsed}
+              key={node.path}
+            >
+              <button
+                className="tree-row directory-row"
+                onClick={() =>
+                  setCollapsedDirectories(previous => {
+                    const next = new Set(previous);
+                    if (next.has(node.path)) next.delete(node.path);
+                    else next.add(node.path);
+                    return next;
+                  })
+                }
+              >
+                <ChevronRight
+                  size={13}
+                  className={`tree-chevron ${collapsed ? "" : "open"}`}
+                />
+                <Folder size={14} className="file-glyph" />
+                <span className="tree-name">{node.name}</span>
+              </button>
+              {!collapsed && (
+                <div role="group" className="tree-children">
+                  <FileTreeView
+                    nodes={node.children}
+                    selectedId={selectedId}
+                    onSelect={onSelect}
+                    collapsedDirectories={collapsedDirectories}
+                    setCollapsedDirectories={setCollapsedDirectories}
+                    collapsedSharedPaths={collapsedSharedPaths}
+                    setCollapsedSharedPaths={setCollapsedSharedPaths}
+                    worktreeLabel={worktreeLabel}
+                  />
+                </div>
+              )}
+            </div>
+          );
+        }
+        const shared = node.entries.length > 1;
+        const hidden = collapsedSharedPaths.has(node.path);
+        if (shared)
+          return (
+            <div
+              className="tree-node"
+              role="treeitem"
+              aria-expanded={!hidden}
+              key={node.path}
+            >
+              <button
+                className="tree-row shared-path-row"
+                onClick={() =>
+                  setCollapsedSharedPaths(previous => {
+                    const next = new Set(previous);
+                    if (next.has(node.path)) next.delete(node.path);
+                    else next.add(node.path);
+                    return next;
+                  })
+                }
+              >
+                <ChevronRight
+                  size={13}
+                  className={`tree-chevron ${hidden ? "" : "open"}`}
+                />
+                <FileCode2 size={14} className="file-glyph" />
+                <span className="tree-name">{node.name}</span>
+                <small className="tree-group-count">
+                  {node.entries.length} worktrees
+                </small>
+              </button>
+              {!hidden && (
+                <div role="group" className="tree-children">
+                  {node.entries.map(entry => (
+                    <FileEntryRow
+                      key={entry.file.id}
+                      entry={entry}
+                      selected={selectedId === entry.file.id}
+                      onSelect={onSelect}
+                      worktreeLabel={worktreeLabel}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        return node.entries.map(entry => (
+          <FileEntryRow
+            key={entry.file.id}
+            entry={entry}
+            selected={selectedId === entry.file.id}
+            onSelect={onSelect}
+            worktreeLabel={worktreeLabel}
+          />
+        ));
+      })}
+    </>
+  );
+}
+
+function FileEntryRow({
+  entry,
+  selected,
+  onSelect,
+  worktreeLabel,
+}: {
+  entry: TreeEntry;
+  selected: boolean;
+  onSelect: (entry: TreeEntry) => void;
+  worktreeLabel: (worktree: Worktree) => string;
+}) {
+  return (
+    <button
+      role="treeitem"
+      aria-selected={selected}
+      className={`tree-row file-row ${selected ? "selected" : ""}`}
+      onClick={() => onSelect(entry)}
+      title={`${entry.worktree.path}/${entry.file.path}`}
+    >
+      <span className="tree-indent" />
+      <FileCode2 size={14} className="file-glyph" />
+      <span className="tree-file-label">
+        <strong title={entry.file.path}>{entry.file.path.split("/").at(-1)}</strong>
+        <small>
+          {entry.file.oldPath ? `${entry.file.oldPath} → ` : ""}
+          {worktreeLabel(entry.worktree)} ·{" "}
+          {entry.worktree.path.split(/[\\/]/).filter(Boolean).slice(-2).join("/")}
+        </small>
+      </span>
+      <span
+        className={`status-dot ${statusClasses[entry.file.status] ?? "status-modified"}`}
+        title={entry.file.status}
+      />
+    </button>
   );
 }
 

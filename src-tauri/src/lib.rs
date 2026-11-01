@@ -51,12 +51,18 @@ struct Worktree {
     unstaged_count: usize,
     untracked_count: usize,
     committed_count: usize,
+    last_observed_change_at: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RepositorySnapshot {
     root: String,
+    available_bases: Vec<String>,
+    comparison_base: Option<String>,
+    comparison_base_oid: Option<String>,
+    comparison_base_is_manual: bool,
+    comparison_base_error: Option<String>,
     worktrees: Vec<Worktree>,
     scanned_at: u64,
 }
@@ -321,7 +327,98 @@ fn parse_status(
     Ok(files)
 }
 
-fn scan_repository(root: &Path) -> Result<RepositorySnapshot, String> {
+fn available_local_branches(root: &Path) -> Result<Vec<String>, String> {
+    let output = git_text(
+        root,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )?;
+    Ok(output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn resolve_comparison_base(
+    root: &Path,
+    available_bases: &[String],
+    requested: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let (label, reference) = if let Some(requested) = requested {
+        if available_bases.iter().any(|branch| branch == requested) {
+            (
+                Some(requested.to_string()),
+                Some(format!("refs/heads/{requested}")),
+            )
+        } else if (7..=64).contains(&requested.len())
+            && requested.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            (Some(requested.to_string()), Some(requested.to_string()))
+        } else {
+            return (
+                Some(requested.to_string()),
+                None,
+                Some(format!("'{requested}' is not a local branch or commit ID")),
+            );
+        }
+    } else {
+        let remote_head = git_text(root, &["symbolic-ref", "refs/remotes/origin/HEAD"]).ok();
+        let default = remote_head
+            .filter(|reference| {
+                git_text(root, &["show-ref", "--verify", "--quiet", reference]).is_ok()
+            })
+            .or_else(|| {
+                ["main", "master"]
+                    .into_iter()
+                    .find(|branch| available_bases.iter().any(|value| value == branch))
+                    .map(|branch| format!("refs/heads/{branch}"))
+            });
+        let Some(reference) = default else {
+            return (
+                None,
+                None,
+                Some(
+                    "No default comparison base is available; select a local branch or commit"
+                        .into(),
+                ),
+            );
+        };
+        let label = reference
+            .strip_prefix("refs/heads/")
+            .or_else(|| reference.strip_prefix("refs/remotes/"))
+            .unwrap_or(&reference)
+            .to_string();
+        (Some(label), Some(reference))
+    };
+    let Some(reference) = reference else {
+        unreachable!()
+    };
+    let revision = format!("{reference}^{{commit}}");
+    match git_text(
+        root,
+        &["rev-parse", "--verify", "--end-of-options", &revision],
+    ) {
+        Ok(oid) if !oid.is_empty() => (label, Some(oid), None),
+        Ok(_) => (
+            label,
+            None,
+            Some("The selected comparison base did not resolve to a commit".into()),
+        ),
+        Err(error) => (
+            label,
+            None,
+            Some(format!(
+                "Selected comparison base could not be resolved: {error}"
+            )),
+        ),
+    }
+}
+
+fn scan_repository(
+    root: &Path,
+    requested_base: Option<&str>,
+    activity_times: Option<&HashMap<String, u64>>,
+) -> Result<RepositorySnapshot, String> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("Invalid repository path: {e}"))?;
@@ -330,6 +427,10 @@ fn scan_repository(root: &Path) -> Result<RepositorySnapshot, String> {
     if records.is_empty() {
         return Err("No Git worktrees were found".into());
     }
+    let available_bases = available_local_branches(&root)?;
+    let comparison_base_is_manual = requested_base.is_some();
+    let (comparison_base, comparison_base_oid, comparison_base_error) =
+        resolve_comparison_base(&root, &available_bases, requested_base);
     let main_path = records
         .first()
         .and_then(|r| r.get("worktree"))
@@ -351,60 +452,32 @@ fn scan_repository(root: &Path) -> Result<RepositorySnapshot, String> {
             .unwrap_or(wt_path.clone())
             .to_string_lossy()
             .into_owned();
-        let base_result = {
-            let upstream = git_text(
-                &wt_path,
-                &[
-                    "rev-parse",
-                    "--abbrev-ref",
-                    "--symbolic-full-name",
-                    "@{upstream}",
-                ],
-            );
-            let remote_head = git_text(&wt_path, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
-            let target = upstream.ok().or_else(|| remote_head.ok()).or_else(|| {
-                ["main", "master"]
-                    .into_iter()
-                    .find(|name| {
-                        git_text(
-                            &wt_path,
-                            &[
-                                "show-ref",
-                                "--verify",
-                                "--quiet",
-                                &format!("refs/heads/{name}"),
-                            ],
-                        )
-                        .is_ok()
-                    })
-                    .map(str::to_string)
-            });
-            if let Some(target) = target {
-                git_text(&wt_path, &["merge-base", "HEAD", &target])
-            } else if branch.is_some() {
-                git_text(&wt_path, &["rev-parse", "HEAD^"])
-            } else {
-                Err("Detached HEAD: no comparison base selected".into())
-            }
-        };
+        let last_observed_change_at = activity_times.and_then(|times| times.get(&id).copied());
+        let base_result = comparison_base_oid
+            .as_deref()
+            .ok_or_else(|| {
+                comparison_base_error
+                    .clone()
+                    .unwrap_or_else(|| "No comparison base selected".into())
+            })
+            .and_then(|target| git_text(&wt_path, &["merge-base", "HEAD", target]));
         let (base, base_error) = match base_result {
             Ok(v) if !v.is_empty() => (Some(v), None),
-            _ => (
+            Err(error) => (
                 None,
-                Some(
+                Some(format!(
+                    "No merge base for {} against {}: {error}",
                     if detached {
-                        "Detached HEAD: no comparison base selected"
+                        "detached HEAD"
                     } else {
-                        "No merge base found; committed changes are unavailable"
-                    }
-                    .into(),
-                ),
+                        "worktree HEAD"
+                    },
+                    comparison_base.as_deref().unwrap_or("selected base")
+                )),
             ),
+            _ => (None, Some("Git returned an empty merge base".into())),
         };
-        let mut files = parse_status(&wt_path, &id, base.as_deref())?;
-        for file in &mut files {
-            let _ = file;
-        }
+        let files = parse_status(&wt_path, &id, base.as_deref())?;
         let unique_paths = files
             .iter()
             .map(|f| &f.path)
@@ -429,11 +502,17 @@ fn scan_repository(root: &Path) -> Result<RepositorySnapshot, String> {
             unstaged_count,
             untracked_count,
             committed_count,
+            last_observed_change_at,
             files,
         });
     }
     Ok(RepositorySnapshot {
         root: root.to_string_lossy().into_owned(),
+        available_bases,
+        comparison_base,
+        comparison_base_oid,
+        comparison_base_is_manual,
+        comparison_base_error,
         worktrees,
         scanned_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -443,13 +522,19 @@ fn scan_repository(root: &Path) -> Result<RepositorySnapshot, String> {
 }
 
 #[tauri::command]
-fn open_repository(path: String) -> Result<RepositorySnapshot, String> {
-    scan_repository(Path::new(&path))
+fn open_repository(
+    path: String,
+    comparison_base: Option<String>,
+) -> Result<RepositorySnapshot, String> {
+    scan_repository(Path::new(&path), comparison_base.as_deref(), None)
 }
 
 #[tauri::command]
-fn refresh_repository(path: String) -> Result<RepositorySnapshot, String> {
-    scan_repository(Path::new(&path))
+fn refresh_repository(
+    path: String,
+    comparison_base: Option<String>,
+) -> Result<RepositorySnapshot, String> {
+    scan_repository(Path::new(&path), comparison_base.as_deref(), None)
 }
 
 #[tauri::command]
@@ -601,26 +686,49 @@ fn watch_repository(
     app: AppHandle,
     state: State<'_, WatchState>,
     path: String,
+    comparison_base: Option<String>,
 ) -> Result<(), String> {
     stop_watch_inner(&state, &path);
-    scan_repository(Path::new(&path))?;
-    let (sender, receiver) = mpsc::sync_channel::<()>(32);
+    scan_repository(Path::new(&path), comparison_base.as_deref(), None)?;
+    let (sender, receiver) = mpsc::sync_channel::<String>(32);
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
     let root = path.clone();
+    let selected_base = comparison_base.clone();
     thread::spawn(move || {
         let mut watchers: Vec<(String, RecommendedWatcher)> = Vec::new();
+        let mut activity_times = HashMap::<String, u64>::new();
         let mut last_signature = String::new();
         while !stopped.load(Ordering::Relaxed) {
-            let event_received = receiver.recv_timeout(Duration::from_secs(2)).is_ok();
+            let mut active_events = std::collections::HashSet::new();
+            let event_received = match receiver.recv_timeout(Duration::from_secs(2)) {
+                Ok(worktree_id) => {
+                    active_events.insert(worktree_id);
+                    true
+                }
+                Err(_) => false,
+            };
             if event_received {
                 thread::sleep(Duration::from_millis(350));
-                while receiver.try_recv().is_ok() {}
+                while let Ok(worktree_id) = receiver.try_recv() {
+                    active_events.insert(worktree_id);
+                }
             }
             if stopped.load(Ordering::Relaxed) {
                 break;
             }
-            let Ok(snapshot) = scan_repository(Path::new(&root)) else {
+            let observed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            for worktree_id in active_events {
+                activity_times.insert(worktree_id, observed_at);
+            }
+            let Ok(snapshot) = scan_repository(
+                Path::new(&root),
+                selected_base.as_deref(),
+                Some(&activity_times),
+            ) else {
                 continue;
             };
             let active = snapshot
@@ -629,10 +737,12 @@ fn watch_repository(
                 .take(64)
                 .map(|worktree| worktree.id.clone())
                 .collect::<std::collections::HashSet<_>>();
+            activity_times.retain(|id, _| active.contains(id));
             watchers.retain(|(id, _)| active.contains(id));
             for worktree in snapshot.worktrees.iter().take(64) {
                 if !watchers.iter().any(|(id, _)| id == &worktree.id) {
-                    if let Ok(watcher) = make_watcher(&worktree.path, sender.clone()) {
+                    if let Ok(watcher) = make_watcher(&worktree.path, &worktree.id, sender.clone())
+                    {
                         watchers.push((worktree.id.clone(), watcher));
                     }
                 }
@@ -652,10 +762,23 @@ fn watch_repository(
     Ok(())
 }
 
-fn make_watcher(path: &str, sender: mpsc::SyncSender<()>) -> Result<RecommendedWatcher, String> {
+fn make_watcher(
+    path: &str,
+    worktree_id: &str,
+    sender: mpsc::SyncSender<String>,
+) -> Result<RecommendedWatcher, String> {
+    let worktree_id = worktree_id.to_string();
     let mut watcher = RecommendedWatcher::new(
-        move |_event| {
-            let _ = sender.try_send(());
+        move |event: notify::Result<notify::Event>| {
+            if let Ok(event) = event {
+                let is_git_metadata = event.paths.iter().any(|path| {
+                    path.components()
+                        .any(|component| component.as_os_str() == ".git")
+                });
+                if !is_git_metadata {
+                    let _ = sender.try_send(worktree_id.clone());
+                }
+            }
         },
         Config::default(),
     )
@@ -768,6 +891,25 @@ mod tests {
     }
 
     #[test]
+    fn watcher_reports_user_changes_and_ignores_git_metadata() {
+        let temp = temp_root();
+        let repo = temp.join("watched");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let watcher = make_watcher(repo.to_str().unwrap(), "worktree-id", sender).unwrap();
+        fs::write(repo.join("changed.txt"), "change").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+            "worktree-id"
+        );
+        while receiver.try_recv().is_ok() {}
+        fs::write(repo.join(".git/index"), "metadata").unwrap();
+        assert!(receiver.recv_timeout(Duration::from_millis(500)).is_err());
+        drop(watcher);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn discovers_linked_worktrees_and_counts_each_change_state_read_only() {
         let temp = temp_root();
         let repo = temp.join("checkout");
@@ -823,7 +965,7 @@ mod tests {
         fs::write(linked.join("shared.txt"), "feature working edit\n").unwrap();
 
         let index_before = fs::read(repo.join(".git/index")).unwrap();
-        let snapshot = scan_repository(&repo).unwrap();
+        let snapshot = scan_repository(&repo, None, None).unwrap();
         assert_eq!(snapshot.worktrees.len(), 2);
         let linked_canonical = linked.canonicalize().unwrap();
         assert!(
@@ -849,6 +991,49 @@ mod tests {
             .iter()
             .find(|worktree| worktree.branch.as_deref() == Some("feature"))
             .unwrap();
+        let non_default_base = scan_repository(&repo, Some("feature"), None).unwrap();
+        assert_eq!(non_default_base.comparison_base.as_deref(), Some("feature"));
+        assert!(non_default_base.comparison_base_is_manual);
+        assert_eq!(non_default_base.worktrees.len(), 2);
+        let main_against_feature = non_default_base
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.branch.as_deref() == Some("main"))
+            .unwrap();
+        let feature_against_feature = non_default_base
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.branch.as_deref() == Some("feature"))
+            .unwrap();
+        assert!(main_against_feature.base.is_some());
+        assert_eq!(
+            feature_against_feature.base.as_deref(),
+            Some(feature.head.as_str())
+        );
+        assert_ne!(main_against_feature.base, feature_against_feature.base);
+
+        let activity = HashMap::from([(main.id.clone(), 1234_u64), (feature.id.clone(), 5678_u64)]);
+        let observed = scan_repository(&repo, None, Some(&activity)).unwrap();
+        assert!(observed.worktrees.iter().any(|worktree| {
+            worktree.branch.as_deref() == Some("main")
+                && worktree.last_observed_change_at == Some(1234)
+        }));
+        assert!(observed.worktrees.iter().any(|worktree| {
+            worktree.branch.as_deref() == Some("feature")
+                && worktree.last_observed_change_at == Some(5678)
+        }));
+
+        let commit_base = scan_repository(&repo, Some(&feature.head), None).unwrap();
+        assert_eq!(
+            commit_base.comparison_base_oid.as_deref(),
+            Some(feature.head.as_str())
+        );
+        let invalid_base = scan_repository(&repo, Some("not-a-local-base"), None).unwrap();
+        assert!(invalid_base.comparison_base_error.is_some());
+        assert!(invalid_base
+            .worktrees
+            .iter()
+            .all(|worktree| worktree.base.is_none() && worktree.base_error.is_some()));
         assert_eq!(
             (main.staged_count, main.unstaged_count, main.untracked_count),
             (2, 1, 1)
