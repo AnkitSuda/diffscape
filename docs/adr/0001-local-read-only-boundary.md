@@ -1,11 +1,11 @@
 # ADR 0001: Local, read-only product boundary
 
-- **Status:** Accepted product constraint
+- **Status:** Accepted product constraint; implementation safeguards and tests are partial, not a security proof
 - **Date:** 2026-11-01
 
 ## Context
 
-Diffscape is intended to aggregate Git worktrees for inspection. Repository mutation would create a high-risk mismatch between a status overview and consequential Git actions. Sending repository data to remote services would also undermine local ownership and privacy.
+Diffscape aggregates Git worktrees for inspection. Repository mutation would create a high-risk mismatch between a status overview and consequential Git actions. Sending repository data to remote services would also undermine local ownership and privacy.
 
 ## Decision
 
@@ -17,4 +17,4 @@ The boundary is testable and release-blocking. Tests must prove repository state
 
 ## Implementation status
 
-Not verified in this checkout; no application code exists here.
+The current committed adapter uses fixed Git argument vectors and has temporary-repository tests that verify index bytes remain unchanged across covered reads. The broader repository-state, hook, network, and adversarial test matrix remains incomplete. See [the read-only contract](../read-only-contract.md) and [status](../status.md); this is not a security certification.

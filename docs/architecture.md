@@ -1,39 +1,29 @@
 # Architecture
 
-**Status: proposed; not implemented or verified in this checkout.** Intended stack: Tauri 2, Rust backend, React + TypeScript UI, Vite frontend, pnpm package management, macOS target.
+**Status: implemented; early and not release-hardened.** The app uses Tauri 2, a Rust Git adapter, React + TypeScript, Vite, and pnpm.
 
-## Intended process boundary
+## Process boundary
 
 ```text
 React / TypeScript UI
-        │ typed, request/response commands and scoped events
+        │ typed purpose-specific invoke/event contracts
         ▼
-Tauri 2 bridge (capability allowlist; no generic shell)
-        │ narrow internal API
+Tauri 2 bridge (folder picker, notifications, local commands)
+        │
         ▼
-Rust domain and Git adapter
+Rust domain and fixed-argv Git adapter
         │ read-only local filesystem + Git inspection
         ▼
-User-selected repository/worktree paths
+User-selected repository and linked worktree paths
 ```
 
-The diagram expresses a proposed boundary, not an existing module layout. Rust owns filesystem traversal, Git process invocation/parsing, and canonical repository identity. The UI owns presentation, selection, filtering, and transient view state. The bridge should expose purpose-specific operations and typed results; it should not expose arbitrary command execution or raw filesystem access to the webview.
+The frontend owns selection, filters, language and display state. Rust owns discovery, status parsing, capped diff reads, and filesystem watching. Git invocation uses argument vectors, not a shell. There is no generic shell command endpoint or remote service.
 
-## Responsibilities and constraints
+## Current responsibilities and limits
 
-- **Frontend:** render discovered repositories and worktrees, represent loading/error/empty states, and request explicit refreshes. Do not implement repository writes or invoke a remote API.
-- **Tauri boundary:** validate arguments, scope permissions to explicitly selected local paths, and return structured errors. Do not grant blanket shell, filesystem, or network capabilities.
-- **Rust domain:** normalize identities, inspect Git state without side effects, and report partial failures without hiding them.
-- **Git adapter:** use a fixed, audited set of read-only operations; never execute hooks, aliases, or repository scripts.
-- **Persistence:** no cloud persistence. Any future local preferences must be separated from user repositories and must not store repository contents by default.
+- **Frontend:** three-pane aggregation, worktree selection, status/path filters, lazy diffs, keyboard navigation, English/Hindi labels, and local preferences. A retained path-level activity timeline appears only in an uncommitted implementation diff observed during the audit, not the committed revision.
+- **Tauri:** purpose-specific commands; native directory selection, optional notifications, and Finder reveal. An external-editor handoff command appears only in that uncommitted diff.
+- **Rust:** NUL-delimited worktree enumeration, status/merge-base parsing, metadata reconciliation and capped diffs. Snapshot commands are observational, not locks.
+- **Persistence:** committed UI browser storage includes the last repository path, per-repository comparison bases, language, notification preference, worktree sort, and diff layout. The uncommitted audit-time UI diff additionally stores a registered-repository list, file sort/grouping preferences, and editor application preference; do not treat these as committed until integrated. Diffs and repository file contents are not intentionally persisted.
 
-## Dependency direction
-
-UI → typed bridge contract → Rust domain → Git adapter. The Git adapter must not depend on UI state. State/event payloads should use versionable, explicit types rather than serialized implementation internals. Exact module names and schemas remain undecided until implementation exists.
-
-## Open design questions
-
-- How repositories are added and how long path access persists on macOS.
-- Which read-only Git commands and minimum Git version are supported.
-- Whether and how filesystem watching is implemented; manual refresh is the safe baseline.
-- How partial discovery failures and linked worktrees with inaccessible paths are surfaced.
+See [status](status.md) for exact validation and outstanding risks. Inaccessible worktrees currently fail a scan rather than returning structured partial results; persistent macOS security-scoped bookmarks and editor launch are not implemented.

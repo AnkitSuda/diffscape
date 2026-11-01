@@ -1,33 +1,31 @@
 # Contributing to Diffscape
 
-Thanks for helping shape Diffscape. The project is at an early documentation baseline; its planned architecture is not yet evidence of working behavior. Confirm current implementation in [Status](docs/status.md) before building on a proposed interface.
+Thanks for helping improve Diffscape. It is an early functional implementation, not yet a signed or release-ready product. Check [implementation status](docs/status.md) and [the read-only contract](docs/read-only-contract.md) before making changes.
 
 ## Before you start
 
-- Check open issues and existing work to avoid duplicating effort.
-- For substantial changes, discuss the direction before investing in implementation.
-- Keep pull requests focused and describe user impact, safety implications, and test evidence.
-- Do not add GitHub Actions, remote services, telemetry, or repository-mutating features.
+- Check existing issues and active work to avoid duplication.
+- Discuss substantial product or architecture changes before implementation.
+- Keep changes focused and describe user impact, safety implications, and test evidence.
+- Do not add GitHub Actions, remote services, telemetry, analytics, or repository-mutating behavior.
 
-## Development environment
+## Development
 
-No application setup commands are currently available because no app manifests or source files are present. Do not infer commands from the planned stack. When implementation exists, follow the verified instructions in the README and [Development](docs/development.md).
-
-The intended package manager is pnpm with a machine-wide global virtual store, and the project must support two Git worktrees. Shared-store installs and maintenance must be serialized; see the documented policy before running package-manager operations.
+Follow the verified prerequisites and commands in [README](README.md) and [Development](docs/development.md). The package manager is pinned pnpm; the project uses the global virtual store and requires installs from each worktree to be serialized as documented.
 
 ## Change expectations
 
-1. State whether a change documents intended behavior or implements behavior.
-2. Preserve the strict read-only Git contract. Any Git integration change should prove that the target repository is unchanged.
-3. Add tests for new behavior and regression cases. Use disposable repositories for Git tests.
-4. Update status and design docs when implementation diverges from or fulfills an existing proposal.
-5. Include manual verification steps when automated tests cannot exercise macOS behavior.
-6. Use `.editorconfig` conventions and keep user-facing text translatable.
+1. Clearly distinguish implemented behavior, committed behavior, local work in progress, and design intent.
+2. Preserve the strict read-only Git contract. Any Git integration change must use fixed, reviewed operations and prove target repository state remains unchanged.
+3. Add regression tests for behavior. Use disposable repositories for Git tests; never use a developer's real repository as a fixture.
+4. Update status and design docs when implementation or verification changes.
+5. Include exact automated commands and macOS manual checks; state when checks were not run.
+6. Keep user-facing strings translatable and preserve keyboard/accessibility behavior.
 
 ## Pull request checklist
 
-- [ ] Scope and implementation status are clearly described.
-- [ ] No repository mutation or network service was introduced.
-- [ ] Relevant automated tests and manual checks are listed, or the gap is explicit.
-- [ ] Documentation and status claims match observed code.
+- [ ] Scope and implementation status are accurately described.
+- [ ] No repository mutation or remote service was introduced.
+- [ ] Relevant automated tests and manual checks are listed, or gaps are explicit.
+- [ ] Documentation matches committed source and verification evidence.
 - [ ] No GitHub Actions workflow or unrelated tooling was added.

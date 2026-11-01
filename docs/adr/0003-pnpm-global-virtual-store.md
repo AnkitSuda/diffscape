@@ -1,6 +1,6 @@
 # ADR 0003: pnpm global virtual store and worktree compatibility
 
-- **Status:** Required policy; repository configuration and compatibility test pending
+- **Status:** Implemented and sequentially verified on pnpm 12.15.0
 - **Date:** 2026-11-01
 
 ## Context
@@ -9,11 +9,11 @@ The project requires pnpm's global virtual store and must remain usable from two
 
 ## Decision
 
-When the pnpm workspace manifest is introduced, configure the canonical setting `virtualStoreType: global`. Keep separate lockfiles per worktree checkout and serialize installs and store maintenance across them. Pin/document the pnpm version and test both worktrees before calling compatibility complete.
+The root `pnpm-workspace.yaml` configures `nodeLinker: isolated` and the canonical `virtualStoreType: global`; `package.json` pins pnpm 12.15.0. Keep each worktree's own checkout, lockfile, and `node_modules` links, and serialize installs and store maintenance. Two linked worktrees completed sequential frozen-lockfile installs and resolved React/Vite through the same machine-wide store paths.
 
 ## Consequences
 
-The policy can reduce duplicate linking work, but a shared store makes concurrent install/prune/repair a coordination risk. Per-worktree installation and cleanup behavior must be verified. Do not confuse the global virtual store with pnpm's package content-addressable store.
+The shared store makes concurrent install/prune/repair a coordination risk. The observed sequential install test does not establish safety for concurrent installs, store pruning, or every cleanup scenario. Do not confuse the global virtual store with pnpm's package content-addressable store.
 
 ## References
 
